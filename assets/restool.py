@@ -8,6 +8,8 @@ parser.add_argument('--extract-from-rom', '-e', action='store_true', help='Extra
 parser.add_argument('--no-hash-check', '-f', action='store_true', help='Bypass the hash check (needed for Lunar Magic roms)')
 parser.add_argument('--no-include-rom', dest='include_rom', action='store_false', help='Don''t include the ROM in the assets file for verification')
 parser.add_argument('--hack', dest='hack', help='Use the specified hack. Valid values: %s' % util.get_hack_variants())
+parser.add_argument('--export-sheets', action='store_true', help='Export GFX files as PNG spritesheets for HD replacement')
+parser.add_argument('--export-dir', default='gfx', metavar='DIR', help='Output directory for exported sheets (default: gfx/)')
 
 optional = parser.add_argument_group('Debug things')
 optional.add_argument('--print-assets-header', action='store_true')
@@ -16,7 +18,11 @@ args = parser.parse_args()
 
 ROM = util.load_rom(args.rom, disable_hash_check = args.no_hash_check, rom_hack = args.hack)
 
-
+if args.export_sheets:
+  import export_sheets
+  print(f'Exporting GFX sheets to {args.export_dir}/ ...')
+  export_sheets.export_sheets(args.export_dir)
+  sys.exit(0)
 
 import compile_resources
 compile_resources.main(args)
