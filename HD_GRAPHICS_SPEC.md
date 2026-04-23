@@ -300,7 +300,7 @@ The PNG always has 128 tiles matching *source* layout. Since Path A writes one f
 
 ---
 
-## Step 4 — Scene build
+## Step 4 — Scene build  ✅ DONE
 
 **Goal:** once per frame, walk OAM and produce a list of `HdSprite` entries describing what to draw. Scene holds the sprite's VRAM top-left tile word-address; the compositor (Step 5) resolves each 8×8 sub-tile against the HD VRAM map so sprites that span multiple recorded regions (e.g. Mario dynamic tiles next to a Path-A slot) render correctly.
 

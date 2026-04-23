@@ -22,8 +22,9 @@ void HdGfx_LoadAll(const char *hd_dir) {
       continue;
     }
 
-    // Validate dimensions: must be multiples of 128/64 with matching scale
-    if (w % 128 != 0 || h % 64 != 0 || w / 128 != h / 64 || w / 128 < 1) {
+    // Validate: width must be a positive multiple of 128 (16 tiles × scale),
+    // height must be a positive multiple of (8 * scale) (any number of tile rows).
+    if (w % 128 != 0 || w / 128 < 1 || h % (8 * (w / 128)) != 0 || h < (8 * (w / 128))) {
       fprintf(stderr, "HD: gfx%02x.png invalid dimensions %dx%d, skipping\n", i, w, h);
       stbi_image_free(rgba);
       g_hd_sheets[i].loaded = false;
@@ -68,6 +69,7 @@ void HdGfx_LoadAll(const char *hd_dir) {
     g_hd_sheets[i].index_buffer = index_buffer;
     g_hd_sheets[i].width        = (uint16)w;
     g_hd_sheets[i].height       = (uint16)h;
+    g_hd_sheets[i].tile_count   = (uint16)((w / (8 * scale)) * (h / (8 * scale)));
     g_hd_sheets[i].scale        = (uint8)scale;
     g_hd_sheets[i].loaded       = true;
 
