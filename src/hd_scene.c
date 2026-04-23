@@ -62,8 +62,8 @@ void HdScene_Build(HdScene *scene, const Ppu *ppu) {
     s->flags     = flags;
     s->layer     = layer;
     s->tile_vram = tile_vram;
-    s->_pad[0]   = 0;
-    s->_pad[1]   = 0;
+    s->tile_num  = (uint8)(oam1 & 0xff);
+    s->_pad      = 0;
   }
 }
 

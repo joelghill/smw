@@ -13,7 +13,8 @@ typedef struct HdSprite {
   uint8  layer;      // 0..3 (OAM priority field)
   uint16 tile_vram;  // VRAM word-addr of the sprite's top-left 8×8 tile.
                      // The compositor resolves per sub-tile via HdVramMap_ResolveTile.
-  uint8  _pad[2];
+  uint8  tile_num;   // Raw OAM tile number (oam1 & 0xff); used to recover objAdr.
+  uint8  _pad;
 } HdSprite;
 
 enum { kHdSceneMax = 128 };

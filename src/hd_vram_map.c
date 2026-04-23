@@ -73,6 +73,10 @@ void HdVramMap_RecordCopyFromStaging(uint16 dst_word_addr, const uint8 *src,
                                      int byte_count) {
   if (byte_count <= 0)
     return;
+
+  uint8  rec_sheet_id    = 0xFF;  // 0xFF sentinel = unmapped
+  uint16 rec_tile_offset = 0;
+
   for (int i = 0; i < g_staging_count; i++) {
     const StagingEntry *e = &g_staging[i];
     if (src < e->base || src >= e->base + e->size)
@@ -83,50 +87,86 @@ void HdVramMap_RecordCopyFromStaging(uint16 dst_word_addr, const uint8 *src,
     if (byte_offset % 32 != 0)
       return;
 
-    uint16 tile_offset = e->sheet_tile_base + (uint16)(byte_offset / 32);
-    uint16 tile_count  = (uint16)(byte_count / 32);
-    if (tile_count == 0)
-      return;
-
-    // Per-frame uploads (e.g. Mario animation tiles) always hit the same
-    // small set of VRAM addresses.  Update an existing entry in-place when
-    // the address and size match so the region list doesn't grow without bound.
-    for (int j = g_region_count - 1; j >= 0; j--) {
-      if (g_regions[j].vram_word_addr == dst_word_addr &&
-          g_regions[j].tile_count == tile_count) {
-        g_regions[j].sheet_id        = e->sheet_id;
-        g_regions[j].src_tile_offset = tile_offset;
-        return;
-      }
-    }
-
-    if (g_region_count < kMaxRegions) {
-      g_regions[g_region_count].vram_word_addr  = dst_word_addr;
-      g_regions[g_region_count].tile_count      = tile_count;
-      g_regions[g_region_count].sheet_id        = e->sheet_id;
-      g_regions[g_region_count].src_tile_offset = tile_offset;
-      g_region_count++;
-    }
-    return;
+    rec_sheet_id    = e->sheet_id;
+    rec_tile_offset = e->sheet_tile_base + (uint16)(byte_offset / 32);
+    break;
   }
-  // src not in any registered staging buffer — no-op.
+
+  // Source not in any registered staging buffer.  If the destination is in
+  // SP1 (VRAM 0x6000–0x67FF — SMW's dynamic Mario/Yoshi slot), we still know
+  // the content is sheet-0x32 data by convention: SP1 VRAM tile N corresponds
+  // 1:1 to sheet-0x32 tile N (Mario charnums 0x00..0x7F reference sheet 0x32
+  // tiles 0..127 directly).  This covers RestoreSP1 (g_ram + 0xbf6/0xcb6) and
+  // Yoshi (g_ram + 0x8500+) uploads, whose source RAM layouts we can't map
+  // generically.  Without this, those tiles would fall through to the Path-A
+  // sheet-0x00 recording and render from the wrong HD sheet.
+  if (rec_sheet_id == 0xFF) {
+    if (dst_word_addr >= 0x6000 && dst_word_addr < 0x6800) {
+      rec_sheet_id    = 0x32;
+      rec_tile_offset = (uint16)((dst_word_addr - 0x6000) / 16);
+    } else {
+      return;
+    }
+  }
+
+  uint16 tile_count = (uint16)(byte_count / 32);
+  if (tile_count == 0)
+    return;
+
+  // Per-frame uploads always hit the same small set of VRAM addresses.
+  // Update an existing entry in-place when address and size match so the
+  // region list doesn't grow without bound.
+  for (int j = g_region_count - 1; j >= 0; j--) {
+    if (g_regions[j].vram_word_addr == dst_word_addr &&
+        g_regions[j].tile_count == tile_count) {
+      g_regions[j].sheet_id        = rec_sheet_id;
+      g_regions[j].src_tile_offset = rec_tile_offset;
+      return;
+    }
+  }
+
+  if (g_region_count < kMaxRegions) {
+    g_regions[g_region_count].vram_word_addr  = dst_word_addr;
+    g_regions[g_region_count].tile_count      = tile_count;
+    g_regions[g_region_count].sheet_id        = rec_sheet_id;
+    g_regions[g_region_count].src_tile_offset = rec_tile_offset;
+    g_region_count++;
+  }
 }
 
 bool HdVramMap_ResolveTile(uint16 vram_word_addr, uint8 *sheet_out,
                            uint16 *tile_out) {
-  // Scan newest → oldest so the most recent upload for a given address wins.
+  // Pick the most specific overlapping region (smallest tile_count wins).
+  // This is ordering-independent: Path-B per-frame uploads (tile_count=2) beat
+  // Path-A bulk uploads (tile_count=128) for the same VRAM address regardless
+  // of which was appended first, which matters because Path-B regions often
+  // exist before Path-A for a slot (title-screen Mario writes before the
+  // level's UploadGraphicsFiles_UploadGFXFile runs) and the update-in-place
+  // scan leaves Path-B at its original array position.
+  // Ties are broken by recency — newer (higher index) wins — so stale
+  // same-specificity regions from a prior level don't shadow current ones.
+  int    best            = -1;
+  uint16 best_tile_count = 0xFFFF;
   for (int i = g_region_count - 1; i >= 0; i--) {
     const HdVramRegion *r = &g_regions[i];
     if (vram_word_addr >= r->vram_word_addr &&
         vram_word_addr < (uint16)(r->vram_word_addr + r->tile_count * 16u)) {
-      uint16 tile_offset_in_region =
-          (vram_word_addr - r->vram_word_addr) / 16;
-      *sheet_out = r->sheet_id;
-      *tile_out  = r->src_tile_offset + tile_offset_in_region;
-      return true;
+      if (r->tile_count < best_tile_count) {
+        best            = i;
+        best_tile_count = r->tile_count;
+      }
     }
   }
-  return false;
+  if (best < 0)
+    return false;
+  const HdVramRegion *r = &g_regions[best];
+  // 0xFF = explicit unmapped marker: return false so the compositor skips.
+  if (r->sheet_id == 0xFF)
+    return false;
+  uint16 tile_offset_in_region = (vram_word_addr - r->vram_word_addr) / 16;
+  *sheet_out = r->sheet_id;
+  *tile_out  = r->src_tile_offset + tile_offset_in_region;
+  return true;
 }
 
 void HdVramMap_Dump(void) {
