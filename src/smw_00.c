@@ -3,6 +3,7 @@
 #include "smw_rtl.h"
 #include "variables.h"
 #include "assets/smw_assets.h"
+#include "hd_vram_map.h"
 
 static FuncV *const kInitAndMainLoop_GameModePtrs[42] = {
     &GameMode00_LoadNintendoPresents,
@@ -2760,6 +2761,10 @@ void UploadGraphicsFiles_UploadGFXFile(uint16 dst_addr, uint8 j, uint8 index) { 
       }
     }
   }
+  // Path A: record this bulk sheet upload in the HD VRAM map so the compositor
+  // can resolve OAM tile addresses back to (sheet_id, tile_in_sheet).
+  if (j != 0xFF && !lunar_magic_upload_hack)
+    HdVramMap_RecordSheetUpload(dst_addr, j, 0, 128);
 }
 
 void ConvertGFX27IntoNormallFormat(uint16 *dst) {  // 00ab42
@@ -3037,6 +3042,9 @@ void GraphicsDecompressionRoutines_DecompressGFX32And33() {  // 00b888
         goto LABEL_2;
     }
     memcpy(g_ram + 0x2000, kGfx32, kGfx32_SIZE);
+    // Register the Mario staging buffer so SmwCopyToVram uploads from
+    // g_ram+0x2000 can be mapped back to sheet 0x32.
+    HdVramMap_RegisterStaging(0x32, g_ram + 0x2000, kGfx32_SIZE, 0);
   }
 }
 

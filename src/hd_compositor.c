@@ -1,5 +1,6 @@
 #include "hd_compositor.h"
 #include "hd_gfx.h"
+#include "hd_vram_map.h"
 #include <stdint.h>
 
 bool  g_hd_enabled      = true;
@@ -7,6 +8,7 @@ uint8 g_hd_scale        = 1;
 bool  g_hd_skip_sprites = false;
 
 void HdCompositor_Init(void) {
+  HdVramMap_Reset();
   HdGfx_LoadAll("gfx/hd");
 }
 

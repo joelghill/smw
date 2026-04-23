@@ -21,6 +21,7 @@
 #include "smw_rtl.h"
 #include "hd_compositor.h"
 #include "hd_gfx.h"
+#include "hd_vram_map.h"
 #include "common_cpu_infra.h"
 #include "config.h"
 #include "util.h"
@@ -551,6 +552,7 @@ error_reading:;
         }
         break;
       case SDL_KEYDOWN:
+        if (event.key.keysym.sym == SDLK_F12) { HdVramMap_Dump(); break; }
         HandleInput(event.key.keysym.sym, event.key.keysym.mod, true);
         break;
       case SDL_KEYUP:

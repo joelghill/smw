@@ -188,25 +188,40 @@ extern bool   g_hd_skip_sprites;   // ppu.c reads this; when true, PpuDrawSprite
 
 ---
 
-## Step 3 — Slot→VRAM tracking
+## Step 3 — Slot→VRAM tracking ✅ DONE
 
 **Goal:** at any point during play, given a VRAM word-address, know which source sheet and which tile-within-sheet was last uploaded there.
 
 **Why:** OAM entries reference VRAM tile numbers (`charnum` + OBJ tile base). To pick the right HD tile we need to resolve that back to `(sheet_id, tile_in_sheet)`.
 
 **Read first:**
-- [src/smw_rtl.h:18-22](src/smw_rtl.h#L18-L22)
-- [src/smw_rtl.c:67+](src/smw_rtl.c#L67) (SmwDrawPpuFrame and surrounding helpers — locate `SmwCopyToVram*` implementations).
-- [src/smw_00.c:607-2600](src/smw_00.c) example call sites (GFX uploads, mostly from `g_ram + offset`).
+- [src/smw_00.c:2694-2763](src/smw_00.c#L2694) `UploadGraphicsFiles_UploadGFXFile` — the bulk sprite/BG sheet uploader. Read all of it.
+- [src/smw_00.c:2656-2692](src/smw_00.c#L2656) `UploadGraphicsFiles` — the per-level driver that invokes the above.
+- [src/smw_00.c:3014-3041](src/smw_00.c#L3014) `GraphicsDecompressionRoutines_DecompressGFX32And33` — Mario sheet staging to `g_ram + 0x2000`.
+- [src/smw_00.c:2307-2327](src/smw_00.c#L2307) `UploadPlayerGFX` — per-frame Mario dynamic tile updates via `SmwCopyToVram` from `g_ram + 0x2000`.
+- [src/smw_00.c:2359-2364](src/smw_00.c#L2359) `RestoreSP1AfterMarioStart` — more Mario slots from `g_ram + 0xbf6 / 0xcb6`.
+- [src/common_rtl.c:821-834](src/common_rtl.c#L821) `SmwCopyToVram` family.
 - [src/snes/ppu.c:752-831](src/snes/ppu.c#L752-L831) `ppu_evaluateSprites` — confirms how `objAdr + usedTile * 16` indexes VRAM.
 
-**Strategy:**
+**Context (result of investigation — the original spec's assumption was wrong):**
 
-GFX uploads to VRAM come from staging RAM (`g_ram + offset`) after decompression. The decompressor writes a known sheet into a known staging location. If we tag staging *buffers* with their sheet ID at decompression time, then `SmwCopyToVram*` can look up the source pointer in the tag map.
+Sprite/BG graphics reach VRAM via **two** distinct paths; hooking only `SmwCopyToVram` misses the primary one.
 
-**Investigation first (spend ≤30 min):**
-- Grep for `decomp_data`, `DecompressGfx`, `DecompGfx`, `decomp_` in `src/smw_*.c` and `assets/compile_resources.*` to find where GFX is decompressed at runtime. Note that decompressed data from the *Python* side (`decomp_data`) is baked into `smw_assets.dat`; the C runtime likely reads pre-decompressed sheets directly.
-- If the C runtime loads sheets directly from `smw_assets.dat` via `assets/smw_assets.h`, identify the loader and the mapping from sheet index to RAM offset.
+- **Path A — bulk per-level sheets (primary for sprites).** `UploadGraphicsFiles_UploadGFXFile(dst_addr, j, index)` calls `GraphicsDecompress(j)` (which decompresses to the transient buffer `g_ram + 0xad00`), then runs an **inline 3bpp→4bpp inflation loop** that writes directly via `uint16 *dst = RtlGetVramAddr() + dst_addr`. It **never** calls `SmwCopyToVram`. Per level, `UploadGraphicsFiles` invokes this 4× for sprite slots and 4× for FG/BG slots, each writing 128 tiles × 32 bytes = 0x800 word-addresses. Sheet id comes straight from `j`.
+- **Path B — dynamic per-frame updates (Mario + animated tiles).** `SmwCopyToVram` variants copy from `g_ram + offset` staging areas. Sources:
+  - **Mario** (`UploadPlayerGFX`, `RestoreSP1AfterMarioStart`): reads from `g_ram + 0x2000` (sheet 0x32 pre-decompressed there by `DecompressGFX32And33`) and from `g_ram + 0xbf6 / 0xcb6` (also sheet 0x32 regions).
+  - **Animated tiles** (`UploadLevelExAnimationData`): reads from `g_ram + graphics_tile_anim_source_address*` — these indices point into variable locations produced by a level-tile-animation subsystem. Typically BG, not sprite; for v1 we can skip resolution and let these come back unmapped.
+  - **Tilemap data** (status bar, blocks layers): source does not correspond to any sheet. Skip.
+
+Sheets 0x32 / 0x33 are pre-decompressed 4bpp (Mario). Sheets 0x00-0x31 are 3bpp on disk and get inflated to 4bpp only along Path A.
+
+**Revised strategy:**
+
+Primary mechanism is a **direct hook inside `UploadGraphicsFiles_UploadGFXFile`** that records `(sheet=j, vram_word_addr=dst_addr, tile_count=128, src_tile_offset=0)` once per call. This covers every per-level sprite and BG sheet with no guessing.
+
+Secondary mechanism is a **staging-buffer registry + `SmwCopyToVram` hook** for dynamic Mario tiles. Register `g_ram + 0x2000` as sheet 0x32's staging base at the point `DecompressGFX32And33` runs. `SmwCopyToVram` looks up its `src` pointer in the registry; if it falls inside a staging range, record a region; otherwise skip (not sheet data). Mario's `0x64a0/0x65a0` uploads from `g_ram + 0xbf6/0xcb6` also fall outside the `g_ram + 0x2000` range — either register a second Mario staging range (if that RAM area is a stable mirror) or accept those slots as unmapped in v1 and fall back to SD.
+
+The PNG always has 128 tiles matching *source* layout. Since Path A writes one full sheet (128 tiles) contiguously, `tile_in_sheet = (vram_word_addr - region_base) / 16`. For Path B, both source and destination are 4bpp (32 B/tile), so the same formula works (just computed on the RAM staging side).
 
 **Tasks:**
 
@@ -215,41 +230,73 @@ GFX uploads to VRAM come from staging RAM (`g_ram + offset`) after decompression
    // Represents a single contiguous VRAM region whose content was uploaded from a known sheet.
    typedef struct HdVramRegion {
      uint16 vram_word_addr;   // base VRAM word address
-     uint16 tile_count;       // number of 16-word tiles (4bpp); 0 if not tile data
+     uint16 tile_count;       // number of 16-word VRAM tiles (4bpp)
      uint8  sheet_id;         // 0..0x33
-     uint16 src_tile_offset;  // first tile within sheet
+     uint16 src_tile_offset;  // first tile within the sheet covered by this region
    } HdVramRegion;
 
    void HdVramMap_Reset(void);
-   void HdVramMap_RecordUpload(uint16 vram_word_addr, const uint8 *src, int byte_count);
-   // Resolves a VRAM tile word-address to (sheet, tile_in_sheet). Returns false if unmapped.
+
+   // Path A: called from UploadGraphicsFiles_UploadGFXFile once per bulk upload.
+   // dst_word_addr and tile_count are in 4bpp VRAM tile units (16 words each).
+   void HdVramMap_RecordSheetUpload(uint16 dst_word_addr, uint8 sheet_id,
+                                    uint16 src_tile_offset, uint16 tile_count);
+
+   // Path B: called from SmwCopyToVram* after the copy. Looks src up in the
+   // staging registry; if unmapped, the call is a no-op.
+   void HdVramMap_RecordCopyFromStaging(uint16 dst_word_addr, const uint8 *src, int byte_count);
+
+   // Staging registry — register fixed RAM regions that hold a known sheet (4bpp, 32 B/tile).
+   void HdVramMap_RegisterStaging(uint8 sheet_id, const uint8 *base, size_t size,
+                                  uint16 sheet_tile_base);
+
+   // Resolve a VRAM tile word-address to (sheet, tile_in_sheet). false if unmapped.
    bool HdVramMap_ResolveTile(uint16 vram_word_addr, uint8 *sheet_out, uint16 *tile_out);
    ```
 2. Create `src/hd_vram_map.c`:
-   - Internally: keep a sorted list of `HdVramRegion`. Small (<256 entries typical).
-   - `RecordUpload`: look up `src` in the sheet-staging-buffer registry (see step 3 below). If the source range falls within a tagged sheet buffer, compute `sheet_id` and `src_tile_offset` (byte offset in staging / 32 for 4bpp, /24 for 3bpp — but inflation to 4bpp happens at VRAM, so the *source* bytes per tile and the *dest* bytes per tile may differ; see gotcha).
-   - Merge adjacent regions from the same sheet when possible to keep the list short.
-   - `ResolveTile`: binary search for the region containing `vram_word_addr`, compute `tile_in_sheet = src_tile_offset + (vram_word_addr - region.vram_word_addr) / 16`.
-3. Add a *sheet staging registry*:
+   - Internal state: an array of `HdVramRegion` (cap ~128 — one per sheet slot is plenty) plus a small staging registry array.
+   - Regions are written in most-recent-last order. `ResolveTile` scans from the end and returns the first region whose `[vram_word_addr, vram_word_addr + tile_count*16)` contains the query address. No merging needed for correctness; add merge later if the list grows long.
+   - `HdVramMap_RecordSheetUpload` just appends a region. If a prior region fully overlaps, mark it stale (or leave it — newer entries win on scan-from-end).
+   - `HdVramMap_RecordCopyFromStaging`:
+     - Walk the staging registry. If `src` lies in `[base, base+size)`, compute `byte_offset = src - base`. Require 32-byte alignment (skip otherwise — partial-tile or unaligned uploads aren't sheet data).
+     - Append a region with `sheet_id` from the registry, `src_tile_offset = sheet_tile_base + byte_offset/32`, `tile_count = byte_count/32`.
+     - If `src` is not in any staging range, skip.
+   - `HdVramMap_Reset` clears regions (not the staging registry).
+3. Hook Path A — edit `UploadGraphicsFiles_UploadGFXFile` in [src/smw_00.c:2694](src/smw_00.c#L2694):
+   - At the end of the function (after both tile-loop branches complete), add:
+     ```c
+     // dst_addr is the VRAM *word* addr; the function always writes 128 4bpp tiles.
+     HdVramMap_RecordSheetUpload(dst_addr, j, 0, 128);
+     ```
+   - This runs for the Lunar-Magic-4bpp branch too; `j` is still the sheet id in that case.
+   - Do **not** record when `lunar_magic_upload_hack` is true (LmHook returned a custom buffer that may not correspond to a vanilla sheet) — guard with `if (!lunar_magic_upload_hack) HdVramMap_RecordSheetUpload(...);`. v1 scope is no-LM anyway.
+4. Hook Path A — edit `UploadGraphicsFiles_Layer3` in [src/smw_00.c:2648](src/smw_00.c#L2648): the layer-3 uploader calls `SmwCopyToVram(0x4000 + i * 0x400, GraphicsDecompress(40 + i), 0x800)` with `p0 = g_ram + 0xad00` (the transient decomp buffer). For v1 (sprites-only), **do not** try to record these — the transient buffer is reused across sheets and doesn't fit the staging model. Accept layer-3 text as unmapped.
+5. Hook Path B — modify the `SmwCopy*` family in [src/common_rtl.c:821](src/common_rtl.c#L821):
+   - After each copy completes, call `HdVramMap_RecordCopyFromStaging(vram_addr, src, n)`.
+   - For `SmwCopyToVramLow` (low-byte only): skip recording. It mutates existing tile data rather than uploading a new tile.
+   - For `SmwCopyToVramPitch32`: skip for v1. It's striped writes used for tilemap/overworld data, never for tile graphics in the sprite OBJ range.
+6. Register Mario's staging buffer. In [src/smw_00.c:3014](src/smw_00.c#L3014) `GraphicsDecompressionRoutines_DecompressGFX32And33`, after the `memcpy(g_ram + 0x2000, kGfx32, kGfx32_SIZE);` calls, add:
    ```c
-   // Called at the point the game decompresses sheet `id` into RAM at [base, base+size).
-   void HdVramMap_RegisterStagingBuffer(uint8 sheet_id, const uint8 *base, size_t size);
+   HdVramMap_RegisterStaging(0x32, g_ram + 0x2000, kGfx32_SIZE, 0);
    ```
-   Implementation: a small array of `{sheet_id, base, size}` tuples. Look up `src` by pointer-range test.
-4. Hook `SmwCopyToVram`, `SmwCopyToVramLow`, `SmwCopyToVramPitch32` (in `src/smw_rtl.c`) to call `HdVramMap_RecordUpload` after performing the copy.
-5. Hook the decompression call site to register staging buffers. If the C runtime pre-decompresses all sheets to fixed RAM locations at boot, register them once at boot. If it decompresses on demand, register at each decompression.
+   And for the `kGfx33` memcpy to `g_ram + 0x7d00` (LM 4bpp branch): `HdVramMap_RegisterStaging(0x33, g_ram + 0x7d00, kGfx33_SIZE, 0);` — but skip for v1 (LM only).
+7. Reset regions on `HdVramMap_Reset` — call from `HdCompositor_Init` at startup. Optionally also on level load, but not required for correctness since newer entries win.
 
 **Gotchas:**
-- **3bpp→4bpp inflation:** sprite sheets are stored natively 3bpp but uploaded to VRAM as 4bpp. That means a single source tile in the staging buffer is 24 bytes; in VRAM it occupies 32 bytes. `src_tile_offset` must be computed from *source* tile stride. The HD PNG's tile count matches the source, not the VRAM layout — so the mapping math is: `tile_in_sheet = src_tile_offset + (src_byte_offset_within_region / src_tile_bytes)`. Record `src_tile_bytes` in the region struct if needed.
-- Some `SmwCopyToVram` calls upload *tilemap data* (e.g. `kStatusBarTilemap_*`), not tile graphics. These don't correspond to a sheet. Detect by: source pointer doesn't fall in any registered staging buffer → skip recording.
-- Uploads from `g_ram + 0x2000` with `t == 0` in [smw_00.c:2311-2324](src/smw_00.c#L2311-L2324) are placeholder/empty uploads. Skip or record with a sentinel "no-sheet" marker.
-- VRAM is 32K words; OBJ tile base is `(obsel & 7) << 13` (bytes) = `(obsel & 7) << 12` (words). Typical OBJ range: `0x4000`–`0x7FFF` words.
-- Don't assume regions are non-overlapping. Later uploads override earlier ones — `RecordUpload` must splice the list correctly (or simply: push a new region; `ResolveTile` returns the *most recent* region containing the address).
+- **3bpp→4bpp inflation is handled by the upload hook, not the map.** Path A's destination is 32 B/tile in VRAM; the HD PNG is indexed by source tile number (0..127), which *is* the VRAM tile number for a 128-tile bulk upload. So `src_tile_offset = 0` and `tile_in_sheet = (vram_word_addr - region.vram_word_addr) / 16` — no bpp arithmetic needed.
+- **Path B is already 4bpp on both sides.** Mario's staging (`g_ram + 0x2000`) is the 4bpp `kGfx32` memcpy'd verbatim. VRAM upload is byte-for-byte. 32 B/tile on both sides.
+- **Special tile cases in `UploadGraphicsFiles_UploadGFXFile`** (j==8 / j==30 / j==0x32 with tileset ≥0x11): these follow a different inner loop but still produce exactly 128 tiles in VRAM from the 128 source tiles. The recording `(sheet=j, tile_count=128, src_tile_offset=0)` is still correct. The per-tile bit-swizzling differences are invisible at the sheet→VRAM-tile-index level — they affect which palette bits each pixel gets, which HD rendering handles by reading the PNG index directly.
+- **`SmwCopyToVram` tilemap calls** (e.g. `kStatusBarTilemap_*`, `blocks_layer*_vramupload_address`): source doesn't lie in any registered staging range → naturally skipped.
+- **Empty/placeholder uploads** ([smw_00.c:2311-2324](src/smw_00.c#L2311-L2324) with `t == 0` using `g_ram + 0x2000` as the fallback): these *do* land in sheet 0x32's staging range and would be spuriously recorded. Guard in the map: if `src == g_ram + 0x2000` *and* the original `t` was zero, skip. Simplest: inside `RecordCopyFromStaging`, reject `src_tile_offset == 0` with `tile_count == 2` as a heuristic — *or* better, add a small branch at the call site that skips the record when the pointer is the placeholder. The cleanest fix is to only record when `t != 0` at the `UploadPlayerGFX` call sites (four lines). Prefer that.
+- **VRAM geometry.** VRAM is 32K words; OBJ tile base is `(obsel & 7) << 12` (words). Typical OBJ range: `0x4000`–`0x7FFF` words. The map stores word-addresses, so no unit confusion.
+- **Regions overlap on purpose.** A per-frame Mario upload writes into 0x6000-0x60FF *inside* the 0x6000-0x67FF region previously recorded by `UploadGraphicsFiles_UploadGFXFile` for sheet 0x32. Scan-from-end ensures the newer Mario region wins, which is what we want.
+- **Scan order.** `ResolveTile` must iterate newest→oldest so the most recent upload for a given address is returned.
 
 **Acceptance:**
-- Add a debug dump command (e.g. bind to F10) that prints the current vram→sheet map.
-- Load level 1-1: top of VRAM has Mario's sheet(s), fire-flower sheet, etc. Cross-reference with `gfx/source/` to sanity-check.
-- `HdVramMap_ResolveTile(objAdr + oamCharnum*16, ...)` for a known sprite returns a plausible (sheet, tile) pair.
+- Add a debug dump command (e.g. bind to F10) that prints the current vram→sheet map: one line per region `(sheet_id, vram_base, tile_count, src_tile_offset)`.
+- Load level 1-1 (Yoshi's Island 1): dump should show 4 sprite-slot regions at 0x6000/0x6800/0x7000/0x7800 with sheet ids from `kUploadGraphicsFiles_SpriteGFXList` (level 0 = sprite graphics setting 0 → entries 0..3 of the list). Cross-reference with `gfx/source/gfx*.png` to sanity-check.
+- After Mario moves, dump should also show small per-frame regions inside 0x6000-0x67FF tagged as sheet 0x32.
+- `HdVramMap_ResolveTile(objAdr + oamCharnum*16, ...)` for a visible Mario sprite returns `(sheet=0x32, tile ≈ charnum & 0x7f)`. For a visible enemy sprite it returns one of the four sprite-slot sheets with `tile = charnum - (vram_slot_base / 16)`.
 
 ---
 

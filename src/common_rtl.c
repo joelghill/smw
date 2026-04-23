@@ -4,6 +4,7 @@
 #include "util.h"
 #include "config.h"
 #include "snes/snes.h"
+#include "hd_vram_map.h"
 
 struct StateRecorder;
 
@@ -821,6 +822,8 @@ void RtlWriteSram(void) {
 void SmwCopyToVram(uint16 vram_addr, const uint8 *src, int n) {
   for (size_t i = 0; i < (n >> 1); i++)
     g_ppu->vram[vram_addr + i] = WORD(src[i * 2]);
+  // Path B: record if source lies in a registered staging buffer (e.g. Mario).
+  HdVramMap_RecordCopyFromStaging(vram_addr, src, n);
 }
 
 void SmwCopyToVramPitch32(uint16 vram_addr, const uint8 *src, int n) {
