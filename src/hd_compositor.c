@@ -1,11 +1,13 @@
 #include "hd_compositor.h"
+#include "hd_gfx.h"
 #include <stdint.h>
 
 bool  g_hd_enabled      = true;
-uint8 g_hd_scale        = 4;
+uint8 g_hd_scale        = 1;
 bool  g_hd_skip_sprites = false;
 
 void HdCompositor_Init(void) {
+  HdGfx_LoadAll("gfx/hd");
 }
 
 void HdCompositor_Draw(uint8 *dst, size_t pitch,

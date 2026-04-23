@@ -20,6 +20,7 @@
 #include "types.h"
 #include "smw_rtl.h"
 #include "hd_compositor.h"
+#include "hd_gfx.h"
 #include "common_cpu_infra.h"
 #include "config.h"
 #include "util.h"
@@ -629,6 +630,7 @@ error_reading:;
   free(g_audiobuffer);
 
   g_renderer_funcs.Destroy();
+  HdGfx_Free();
 
 #ifdef __SWITCH__
   SwitchImpl_Exit();

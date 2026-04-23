@@ -130,7 +130,7 @@ extern bool   g_hd_skip_sprites;   // ppu.c reads this; when true, PpuDrawSprite
 
 ---
 
-## Step 2 — HD PNG loader
+## Step 2 — HD PNG loader ✅ DONE
 
 **Goal:** load all `gfx/hd/gfxNN.png` at startup into palette-index buffers; keep per-sheet metadata. Missing sheets are OK — recorded as "no HD".
 
@@ -180,9 +180,11 @@ extern bool   g_hd_skip_sprites;   // ppu.c reads this; when true, PpuDrawSprite
 - The tile index layout within a sheet matches source: row-major, 16 tiles per row. Store flat (no per-tile chunking); compositor computes tile offsets on the fly.
 
 **Acceptance:**
-- Build clean.
-- With some test HD PNGs in `gfx/hd/`, startup logs show loaded sheets with correct scale.
-- With `gfx/hd/` empty, startup logs warnings or "no HD sheets", `g_hd_scale` stays 1 (game runs as if HD were off).
+- ✅ Build clean.
+- ✅ With HD PNGs in `gfx/hd/`, startup logs show loaded sheets with correct scale.
+- ✅ With `gfx/hd/` empty, `g_hd_scale` stays 1 and game runs at SD.
+
+**Post-completion note:** `glsl_shader.c` already defined `STB_IMAGE_IMPLEMENTATION`, so `hd_gfx.c` omits the define and just includes the header directly.
 
 ---
 
