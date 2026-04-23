@@ -288,7 +288,7 @@ The PNG always has 128 tiles matching *source* layout. Since Path A writes one f
 - **Special tile cases in `UploadGraphicsFiles_UploadGFXFile`** (j==8 / j==30 / j==0x32 with tileset ≥0x11): these follow a different inner loop but still produce exactly 128 tiles in VRAM from the 128 source tiles. The recording `(sheet=j, tile_count=128, src_tile_offset=0)` is still correct. The per-tile bit-swizzling differences are invisible at the sheet→VRAM-tile-index level — they affect which palette bits each pixel gets, which HD rendering handles by reading the PNG index directly.
 - **`SmwCopyToVram` tilemap calls** (e.g. `kStatusBarTilemap_*`, `blocks_layer*_vramupload_address`): source doesn't lie in any registered staging range → naturally skipped.
 - **Empty/placeholder uploads** ([smw_00.c:2311-2324](src/smw_00.c#L2311-L2324) with `t == 0` using `g_ram + 0x2000` as the fallback): these *do* land in sheet 0x32's staging range and would be spuriously recorded. Guard in the map: if `src == g_ram + 0x2000` *and* the original `t` was zero, skip. Simplest: inside `RecordCopyFromStaging`, reject `src_tile_offset == 0` with `tile_count == 2` as a heuristic — *or* better, add a small branch at the call site that skips the record when the pointer is the placeholder. The cleanest fix is to only record when `t != 0` at the `UploadPlayerGFX` call sites (four lines). Prefer that.
-- **VRAM geometry.** VRAM is 32K words; OBJ tile base is `(obsel & 7) << 12` (words). Typical OBJ range: `0x4000`–`0x7FFF` words. The map stores word-addresses, so no unit confusion.
+- **VRAM geometry.** VRAM is 32K words; OBJ tile base is `(obsel & 7) << 13` (words) — each unit is a 16 KB (0x2000-word) region. See `PPU_objTileAdr1` in [src/snes/ppu.h:168](src/snes/ppu.h#L168). Typical OBJ base for SMW: word 0x6000. The map stores word-addresses, so no unit confusion.
 - **Regions overlap on purpose.** A per-frame Mario upload writes into 0x6000-0x60FF *inside* the 0x6000-0x67FF region previously recorded by `UploadGraphicsFiles_UploadGFXFile` for sheet 0x32. Scan-from-end ensures the newer Mario region wins, which is what we want.
 - **Scan order.** `ResolveTile` must iterate newest→oldest so the most recent upload for a given address is returned.
 
@@ -302,12 +302,14 @@ The PNG always has 128 tiles matching *source* layout. Since Path A writes one f
 
 ## Step 4 — Scene build
 
-**Goal:** once per frame, walk OAM and produce a list of `HdSprite` entries describing what to draw.
+**Goal:** once per frame, walk OAM and produce a list of `HdSprite` entries describing what to draw. Scene holds the sprite's VRAM top-left tile word-address; the compositor (Step 5) resolves each 8×8 sub-tile against the HD VRAM map so sprites that span multiple recorded regions (e.g. Mario dynamic tiles next to a Path-A slot) render correctly.
 
 **Read first:**
 - [src/snes/ppu.c:752-831](src/snes/ppu.c#L752-L831) `ppu_evaluateSprites` — copy the OAM-decoding logic.
 - [src/snes/ppu.h:167-172](src/snes/ppu.h#L167-L172) — `PPU_objSize`, `PPU_objTileAdr1/2`, `PPU_objPriority`.
 - Step 3 outputs.
+
+**Key fact:** `PPU_objTileAdr1` returns a **word** address (see [ppu.h:168](src/snes/ppu.h#L168): `(obsel & 7) << 13` — `<< 13` words = 16 KB). `ppu->vram` is `uint16_t[0x8000]` and [ppu.c:809](src/snes/ppu.c#L809) indexes it directly with `objAdr + usedTile * 16`. **Do not divide `objAdr` by 2.**
 
 **Tasks:**
 
@@ -316,12 +318,12 @@ The PNG always has 128 tiles matching *source* layout. Since Path A writes one f
    typedef struct HdSprite {
      int16  x, y;          // SD pixel coords, top-left. May be negative / offscreen; clip in compositor.
      uint8  size;          // sprite size in SD pixels (8, 16, 32, or 64). Square.
-     uint8  sheet;         // source sheet id; 0xFF if unresolved (skip draw)
-     uint16 tile;          // first tile within the sheet (top-left tile of the sprite)
      uint8  palette;       // 0..7; CGRAM base = 0x80 + palette*16
-     uint8  flags;         // bit0: hflip, bit1: vflip; room for more
+     uint8  flags;         // bit0: hflip, bit1: vflip
      uint8  layer;         // 0..3 (OAM priority)
-     uint8  _pad;
+     uint16 tile_vram;     // VRAM word-addr of the sprite's top-left 8×8 tile.
+                           // Compositor re-resolves per sub-tile via HdVramMap_ResolveTile.
+     uint8  _pad[2];
    } HdSprite;
 
    enum { kHdSceneMax = 128 };
@@ -333,76 +335,219 @@ The PNG always has 128 tiles matching *source* layout. Since Path A writes one f
 
    void HdScene_Build(HdScene *scene, const Ppu *ppu);
    ```
-2. Create `src/hd_scene.c`:
-   - `HdScene_Build`: set `count = 0`. Iterate `for (int i = 0; i < 128; i++)`:
-     - Read `oam0 = ppu->oam[i*2]`, `oam1 = ppu->oam[i*2 + 1]`, high-OAM bits via `(ppu->highOam[i >> 2] >> ((i & 3) * 2))`. (Double-check stride: `highOam` packs 2 bits per sprite — bit0 = x-high, bit1 = size-select.)
-     - Decode: `x = oam0 & 0xff; x |= (highbits & 1) << 8; if (x > 255) x -= 512;` `y = oam0 >> 8;`
-     - `size = spriteSizes[PPU_objSize(ppu)][(highbits >> 1) & 1];` (use `ppu_evaluateSprites`'s `spriteSizes` table — copy it into `hd_scene.c`).
-     - `tile_num = oam1 & 0xff; charnum_high = (oam1 >> 8) & 1;`
-     - `objAdr = charnum_high ? PPU_objTileAdr2(ppu) : PPU_objTileAdr1(ppu);`
-     - VRAM word addr of the sprite's top-left tile: `objAdr_words = objAdr >> 1; tile_vram = objAdr_words + tile_num * 16;` (4bpp tile = 16 words; note `objAdr` from `PPU_objTileAdr*` may already be in bytes; confirm and normalize).
-     - Resolve via `HdVramMap_ResolveTile(tile_vram, &sheet, &tile_in_sheet)`. If unresolved, set `sheet = 0xFF`.
-     - `palette = (oam1 >> 9) & 7;`
-     - `flags = ((oam1 >> 14) & 1) | ((oam1 >> 14) & 2);` — oam1 bit 14 = hflip, bit 15 = vflip. Pack into `flags` bits 0,1.
-     - `layer = (oam1 >> 12) & 3;`
-   - Skip entries fully offscreen (all pixels clipped). Cheap bbox test.
-   - Skip hidden sprites (y == 0xF0 is the traditional "hidden" y in SMW; check).
-3. In `HdCompositor_Draw`: allocate a static `HdScene g_hd_scene;` and call `HdScene_Build(&g_hd_scene, ppu)` before compositing sprites. (Step 5 uses it.)
+   Note: we store `tile_vram` (the VRAM word-address of the top-left tile) rather than a resolved `(sheet, tile_in_sheet)` pair. Step 5 walks the sub-tile grid in VRAM space and resolves each one independently. This fixes sprites that straddle two HD-map regions (common for Mario: Path-B dynamic tiles inside a Path-A sprite slot).
+
+2. Copy the `spriteSizes` table from [ppu.c:754-757](src/snes/ppu.c#L754-L757) into `hd_scene.c`:
+   ```c
+   static const uint8 spriteSizes[8][2] = {
+     {8, 16}, {8, 32}, {8, 64}, {16, 32},
+     {16, 64}, {32, 64}, {16, 32}, {16, 32}
+   };
+   ```
+   All entries are square sides. Treat sprites as square.
+
+3. Create `src/hd_scene.c`. `HdScene_Build`:
+   - `scene->count = 0;`
+   - OAM stride matches [ppu.c:762](src/snes/ppu.c#L762): `ppu_evaluateSprites` walks `index = 0..254 step 2` (128 sprites, 2 words each — `ppu->oam[0x100]` total). Sprite *i* lives at `oam[i*2]` (y<<8 | x-low) and `oam[i*2 + 1]` (tile | attrs).
+   - High-OAM stride: `index = i*2`, so `highOam[index >> 3] == highOam[i >> 2]`. The 2 bits for sprite *i* sit at bit positions `(index & 7)` (x-high) and `(index & 7) + 1` (size-select) — equivalently `(i & 3)*2` and `(i & 3)*2 + 1`. Extract:
+     ```c
+     uint8 hi    = (ppu->highOam[i >> 2] >> ((i & 3) * 2)) & 3;
+     bool  xhigh = hi & 1;
+     bool  large = hi & 2;
+     ```
+   - For each `i` in `0..127`:
+     ```c
+     uint16 oam0 = ppu->oam[i*2];
+     uint16 oam1 = ppu->oam[i*2 + 1];
+
+     int16 x = oam0 & 0xff;
+     x |= xhigh << 8;
+     if (x > 255) x -= 512;                     // sign-extend 9-bit
+     uint8 y = oam0 >> 8;
+
+     uint8 size = spriteSizes[PPU_objSize(ppu)][large ? 1 : 0];
+
+     uint8  tile_num      = oam1 & 0xff;
+     bool   charnum_high  = (oam1 >> 8) & 1;
+     uint16 objAdr        = charnum_high ? PPU_objTileAdr2(ppu)   // already in words
+                                         : PPU_objTileAdr1(ppu);
+     uint16 tile_vram     = (objAdr + tile_num * 16) & 0x7fff;    // 4bpp tile = 16 words
+
+     uint8 palette = (oam1 >> 9) & 7;
+     uint8 flags   = (oam1 >> 14) & 3;          // bit 0 = hflip, bit 1 = vflip
+     uint8 layer   = (oam1 >> 12) & 3;
+     ```
+   - Skip hidden sprites: in SMW a sprite with `y == 0xF0` is the conventional "hidden" marker. Also skip anything whose bbox falls entirely outside `[0, 256) × [0, sd_height)`.
+   - Append to `scene->sprites[scene->count++]` if `scene->count < kHdSceneMax`.
+   - Do **not** resolve `HdVramMap_ResolveTile` here — leave the VRAM address on the struct; the compositor resolves per sub-tile.
+
+4. In `HdCompositor_Draw`: declare a file-static `HdScene g_hd_scene;` and call `HdScene_Build(&g_hd_scene, g_my_ppu)` before the sprite composite pass (Step 5).
 
 **Gotchas:**
-- OAM packing is tricky. Read `ppu->oam` as uint16 (2 entries per 32-bit logical sprite is wrong — `oam[i*2]` is word 0, `oam[i*2 + 1]` is word 1; 128 sprites × 2 words = 256 uint16 total, matches `ppu->oam[0x100]`).
-- highOam: 32 bytes total = 256 bits = 2 bits/sprite × 128. Layout: sprite i's bits live at `highOam[i >> 2]`, positions `(i & 3) * 2` (low) and `+1` (high). Confirm by comparing with `ppu_evaluateSprites`.
-- Sprite y=0xF0 in SMW hides the sprite (off-bottom). Skip if outside the visible range.
-- `spriteSizes[PPU_objSize(ppu)]` returns `{small, large}` sides. If non-square (rare), clarify; v1 can assume square.
-- Sprites larger than 8×8 reference a grid of tiles inside the sheet. Per ppu.c:807, tile arrangement within a sprite uses a "16 tiles wide" wrap: `usedTile = (((tile_num >> 4) + (row >> 3)) << 4) | (((tile_num & 0xf) + (col >> 3)) & 0xf)`. The compositor (Step 5) replicates this walk; scene only stores the top-left `tile_num`.
+- **OAM priority rotation (`PPU_objPriority(ppu)`) is NOT handled.** Real PPU starts OAM iteration at `oamaddl & 0xfe` when bit is set. SMW gameplay rarely uses this; accept as a v1 limitation and document in Known Limitations.
+- **`y == 0xF0` hide is a heuristic**, not a match for PPU. PPU renders any sprite whose `row = line - y` falls in `[0, spriteHeight)`. The heuristic is safe for SMW's conventions; a bbox offscreen test provides a backstop.
+- **Size table entries are all square** (`{8,16}`, `{8,32}`, …). V1 treats `size` as one number (square side).
+- **`objAdr` is in words.** Every mention of "byte address" for OAM tile base is wrong — see Key Fact above.
+- **Sub-tile / sheet layout.** Per [ppu.c:807-808](src/snes/ppu.c#L807-L808), tiles within a multi-8×8 sprite wrap on a 16-tile row: `usedTile = ((((tile & 0xff) >> 4) + (row >> 3)) << 4) | (((tile & 0xf) + (col >> 3)) & 0xf)`. Rows do not wrap — a 32×32 sprite at `tile_num=0xf0` references tile indices past 0xff (into the next VRAM page). The compositor uses the same formula operating on VRAM word-addresses.
 
 **Acceptance:**
-- Add a debug print (e.g. F9) dumping `g_hd_scene` for one frame.
-- Run Yoshi's Island 1: scene should contain Mario (layer 2 typically), bushes/clouds (none — those are BG), maybe powerup items. Counts match the visibly drawn sprites.
+- Add an `#ifdef HD_DEBUG` dump (e.g. F9) printing `g_hd_scene`: index, `(x, y)`, `size`, `tile_vram`, `palette`, `flags`, `layer`.
+- Run Yoshi's Island 1: scene count matches the visibly drawn sprite count (Mario is ~4 sprites, plus any enemies / powerups / HUD sprites). Mario's `tile_vram` should fall inside a region the VRAM map tags as sheet 0x32.
 
 ---
 
 ## Step 5 — CPU compositor (baseline, no effects)
 
-**Goal:** HD sprites actually appear on screen. Palette applied via current CGRAM. Sprites render on top of the upscaled BG.
+**Goal:** HD sprites actually appear on screen. Palette applied via current CGRAM. Sprites render on top of the upscaled BG. Each 8×8 sub-tile is resolved independently against the HD VRAM map so sprites spanning Path-A / Path-B regions still render correctly.
 
 **Read first:**
 - Step 1, 2, 4 outputs.
 - [src/snes/ppu.c:693-710](src/snes/ppu.c#L693-L710) final composite pass — reference for CGRAM + brightness math.
-- [src/snes/ppu.c:797-826](src/snes/ppu.c#L797-L826) — reference for per-tile sub-tile iteration inside a large sprite.
+- [src/snes/ppu.c:787-826](src/snes/ppu.c#L787-L826) — reference for the vflip-row / hflip-col / usedTile logic this step mirrors.
 
-**Tasks:**
+### Iteration order (nail this down first)
 
-1. Extend `src/hd_compositor.c`:
-   - After the BG upscale pass, walk `g_hd_scene` sorted by `layer` low→high. Within the same layer, iterate in OAM order *reversed* (matches PPU convention — later OAM entries draw over earlier at equal priority? Actually PPU: lower-index OAM has higher priority with OAM priority rotation disabled. Validate against `ppu_evaluateSprites` behavior; it iterates i=0..127 and writes pixels only if the target is empty, so *earlier* OAM wins. Mirror that by iterating earlier-first and skipping already-written pixels, *or* iterate in reverse for an alpha overwrite model. For v1, alpha-overwrite in reverse order is simpler and near-identical for non-overlapping sprites.)
-2. For each `HdSprite s` with `s.sheet != 0xFF`:
-   - `HdSheet *sheet = &g_hd_sheets[s.sheet]; if (!sheet->loaded) continue;`
-   - `int S = g_hd_scale;` (must equal `sheet->scale` — assert in debug).
-   - `int palette_base = 0x80 + s.palette * 16;`
-   - For each 8×8 sub-tile within the sprite (walk col=0..s.size step 8, row=0..s.size step 8):
-     - Compute `usedTile` via the formula from ppu.c:807 (honoring hflip/vflip).
-     - Tile's top-left in sheet pixels: `(tx, ty) = ((usedTile & 0xf) * 8*S, (usedTile >> 4) * 8*S)`. Note `usedTile` may wrap; mask to `0..127`.
-     - Destination top-left in HD buffer: `(dx, dy) = ((s.x + col) * S, (s.y + row) * S)`.
-     - For each HD pixel `(px, py)` in `[0, 8S)²`:
-       - Apply hflip/vflip to source coords: `sx = hflip ? (8*S - 1 - px) : px; sy = vflip ? (8*S - 1 - py) : py;`
-       - `index = sheet->index_buffer[(ty + sy) * sheet->width + (tx + sx)];`
-       - If `index == 0`: skip (transparent).
-       - Clip destination: `out_x = dx + px; out_y = dy + py; if out of HD bounds, skip.`
-       - `color = ppu->cgram[palette_base + index];` — 15-bit BGR5.
-       - Apply brightness: `r = ppu->brightnessMult[(color >> 0) & 0x1f]; g = ...[(color >> 5) & 0x1f]; b = ...[(color >> 10) & 0x1f];`
-       - Write BGRA: `dst_pixel = (b << 0) | (g << 8) | (r << 16) | (0xff << 24);`
-3. Performance: hoist invariants (tile pointer, palette pointer) outside inner loops. Don't worry about SIMD yet.
+PPU behavior ([ppu.c:821](src/snes/ppu.c#L821)): within a priority band, `ppu_evaluateSprites` walks OAM `i = 0..127` and *only writes a pixel if the target is still empty*. Result: **lower-index OAM wins at overlap.**
+
+To reproduce this with an alpha-overwrite model, iterate each layer from **highest OAM index down to lowest** (later-index painted first, then earlier-index painted on top). Between layers, go low layer → high layer so higher OAM-priority lands above.
+
+```c
+for (int layer = 0; layer < 4; layer++) {
+  for (int k = g_hd_scene.count - 1; k >= 0; k--) {
+    HdSprite *s = &g_hd_scene.sprites[k];
+    if (s->layer != layer) continue;
+    // … composite s into HD buffer …
+  }
+}
+```
+
+### Sprite composite (per sprite, output-space walk)
+
+Walk *output* pixel offsets `(row, col)` in `[0, size)`; map each to a source pixel via the flip rules, then to a VRAM tile, then to `(sheet, tile_in_sheet)` via `HdVramMap_ResolveTile`, then to an HD index, CGRAM color, brightness-mapped BGRA.
+
+```c
+int     S            = g_hd_scale;
+bool    hflip        = s->flags & 1;
+bool    vflip        = s->flags & 2;
+uint16  base_vram    = s->tile_vram;              // top-left 8×8 tile, word addr
+uint8   tile_hi      = (base_vram / 16) >> 4;     // = (charnum >> 4) of top-left tile
+uint8   tile_lo      = (base_vram / 16) & 0xf;    // = (charnum & 0xf)
+uint16  obj_page     = base_vram & ~0xff;         // 256-word page containing the top-left tile
+                                                  // (used to mask the col-wrap back into VRAM)
+int     palette_base = 0x80 + s->palette * 16;
+uint16 *cgram        = ppu->cgram;
+uint8  *bmult        = ppu->brightnessMult;       // final-line value; see Known Limitations
+
+for (int row = 0; row < s->size; row++) {
+  int srcRow = vflip ? (s->size - 1 - row) : row;
+  int out_y  = (s->y + row) * S;
+  if (out_y < 0 || out_y >= hd_height) continue;       // cheap clip; per-row, not per-HD-line
+
+  // Which sub-tile row & within-tile y-pixel (in SD units) we're sampling:
+  int tile_row_src   = srcRow >> 3;
+  int y_in_tile_sd   = srcRow & 7;
+
+  for (int col = 0; col < s->size; col++) {
+    int srcCol = hflip ? (s->size - 1 - col) : col;
+    int out_x  = (s->x + col) * S;
+    if (out_x < 0 || out_x >= hd_width) continue;
+
+    int tile_col_src = srcCol >> 3;
+    int x_in_tile_sd = srcCol & 7;
+
+    // PPU's usedTile formula, operating on VRAM word-addresses.
+    // Column wraps within the 16-tile row of the object page; rows do not wrap
+    // (they continue past the end of the page, matching PPU behavior).
+    uint8  u_hi = (tile_hi + tile_row_src) & 0xff;
+    uint8  u_lo = (tile_lo + tile_col_src) & 0xf;
+    uint16 usedTile  = ((uint16)u_hi << 4) | u_lo;
+    uint16 tile_vram = (obj_page + usedTile * 16) & 0x7fff;
+
+    uint8  sheet_id;
+    uint16 tile_in_sheet;
+    if (!HdVramMap_ResolveTile(tile_vram, &sheet_id, &tile_in_sheet))
+      continue;                                          // no HD tile — skip this pixel
+    HdSheet *sheet = &g_hd_sheets[sheet_id];
+    if (!sheet->loaded) continue;
+    // Uniform-scale invariant from Step 2.
+    assert(sheet->scale == S);
+
+    // HD sheet coords of the tile's top-left:
+    int tx = (tile_in_sheet & 0xf) * 8 * S;
+    int ty = (tile_in_sheet >> 4)  * 8 * S;   // tile_in_sheet must be < 128 (sheet holds 0..127)
+    if (tile_in_sheet >= 128) continue;       // out-of-sheet reference — skip
+
+    // HD pixel range for this (row, col) = one SD pixel = S×S HD pixels.
+    for (int py = 0; py < S; py++) {
+      int dst_y = out_y + py;
+      if (dst_y < 0 || dst_y >= hd_height) continue;
+      uint32_t *dst_row = (uint32_t *)((uint8 *)hd_buf + dst_y * hd_pitch);
+      for (int px = 0; px < S; px++) {
+        int dst_x = out_x + px;
+        if (dst_x < 0 || dst_x >= hd_width) continue;
+
+        int src_x_hd = tx + x_in_tile_sd * S + px;
+        int src_y_hd = ty + y_in_tile_sd * S + py;
+        uint8 index = sheet->index_buffer[src_y_hd * sheet->width + src_x_hd];
+        if (index == 0) continue;                        // HD-PNG transparent
+
+        uint16 color = cgram[palette_base + index];      // 15-bit ..bbbbb gggggrrrrr (R low)
+        uint8  r     = bmult[(color >>  0) & 0x1f];
+        uint8  g     = bmult[(color >>  5) & 0x1f];
+        uint8  b     = bmult[(color >> 10) & 0x1f];
+        dst_row[dst_x] = (uint32_t)b | ((uint32_t)g << 8) | ((uint32_t)r << 16) | 0xff000000u;
+      }
+    }
+  }
+}
+```
+
+Notes on the code above:
+- **Flip handling.** Both the tile-select (`tile_row_src`, `tile_col_src`) and the within-tile offset (`y_in_tile_sd`, `x_in_tile_sd`) derive from `srcRow`/`srcCol`, which have the flip already applied. This matches ppu.c: [ppu.c:792](src/snes/ppu.c#L792) flips `row` before the sub-tile loop, and [ppu.c:807](src/snes/ppu.c#L807) flips `col` via `usedCol`. Getting either one wrong breaks flipped large sprites (all of Mario's left-facing frames).
+- **Per-sub-tile VRAM resolution.** `HdVramMap_ResolveTile` runs once per SD pixel. That's 64 resolves per 8×8 sub-tile — acceptable at v1 scale. If profiling shows it matters, hoist the resolve out to an `(8×8)` sub-tile loop.
+- **Mask to sheet.** `tile_in_sheet >= 128` means the sprite referenced VRAM tiles past the end of a recorded region's sheet. Treat as unmapped and skip.
+- **BGRA byte order.** Matches [ppu.c:709](src/snes/ppu.c#L709): R in bits 16-23, G in 8-15, B in 0-7. Alpha set to 0xff on every sprite pixel (BG upscale leaves alpha = 0; setting alpha here prepares for Step 6's blend).
+- **Sheet scale invariant.** Step 2 rejects sheets whose scale doesn't match `g_hd_scale`; the assert is a debug safety net.
+
+### Integrate into `HdCompositor_Draw`
+
+```c
+void HdCompositor_Draw(uint8 *dst, size_t pitch,
+                       const uint8 *sd_pixels, int sd_width, int sd_height) {
+  int S = g_hd_scale;
+  int hd_width  = sd_width  * S;
+  int hd_height = sd_height * S;
+
+  // 1. Nearest-upscale BG (existing code from Step 1).
+  // 2. Build scene from current PPU state.
+  HdScene_Build(&g_hd_scene, g_my_ppu);
+  // 3. Composite sprites layer-by-layer, high-OAM-first within layer.
+  HdCompositor_DrawSprites(dst, pitch, hd_width, hd_height, g_my_ppu);
+}
+```
+
+`g_my_ppu` is the reimplementation's PPU; `g_snes->ppu` is the reference emulator's. Use `g_my_ppu` so HD output reflects what the game code actually wrote. Verify the symbol exists (declared in [src/main.c](src/main.c) / [src/variables.h](src/variables.h)) before using.
+
+### Performance hoisting
+
+Inside the per-sprite function:
+- Hoist `sheet`, `sheet->index_buffer`, `sheet->width`, `palette_base`, `cgram`, `bmult` out of inner loops.
+- Hoist sub-tile resolve if profiling demands it (resolve once per 8×8 sub-tile; store `sheet_id`, `tile_in_sheet` in locals; loop the 8×8 SD pixels × S² HD pixels).
+- Don't attempt SIMD in v1.
 
 **Gotchas:**
-- Flip within a large sprite is tricky: flipping also *reorders* the sub-tiles (see ppu.c:806 `usedCol`). Mirror the same formula.
-- `usedTile` math needs mask-to-128: the PPU uses `oam1 & 0xff` + offsets with `& 0xf` on the low nibble, which wraps columns within the 16-tile row but not rows; verify by re-reading ppu.c:807 and matching exactly.
-- Brightness: `ppu->brightnessMult` is populated per-scanline in ppu.c's render path; it's valid after `draw_ppu_frame()` runs. Compose *after* the PPU scan (which is what happens in `RtlDrawPpuFrame`).
-- CGRAM colors are 15-bit: `bbbbb gggggrrrr r` with R low. Match the existing `PpuDrawWholeLine` mapping exactly to preserve color fidelity.
-- Don't swap R/B — SDL's expected format is BGRA little-endian; `opengl.c` uploads with `GL_BGRA` + `GL_UNSIGNED_INT_8_8_8_8_REV`. Matches what ppu.c writes. Follow that convention.
+- **Large-sprite vflip must flip the sub-tile index, not just the within-tile y.** If only the within-tile y is flipped, a vflipped 32×32 sprite renders each 8×8 flipped individually but in unflipped top-to-bottom order — visibly wrong. The pseudocode above handles this by deriving `srcRow` from output `row` first and then splitting into tile-row + pixel-row from the flipped value.
+- **`brightnessMult` is per-scanline** and updated as ppu.c runs each line (see [ppu.c:110-113](src/snes/ppu.c#L110-L113)). At `HdCompositor_Draw` time, only the *last* line's brightness is available. Fade effects that HDMA `$2100` across the frame will apply the final-line brightness uniformly to HD sprites. Accepted v1 limitation — document.
+- **Alpha in the BG buffer is 0.** Sprite writes always set A=0xff, which is what Step 6 needs for alpha-blit. Do not assume the BG pass wrote opaque alpha.
+- **CGRAM format.** 15-bit `..bbbbb gggggrrrrr` (R in low 5 bits). Match [ppu.c:709-711](src/snes/ppu.c#L709-L711) exactly.
+- **Pixel format is BGRA little-endian** (what [opengl.c](src/opengl.c) uploads with `GL_BGRA` + `GL_UNSIGNED_INT_8_8_8_8_REV`). Don't swap R/B.
+- **OAM priority rotation is still ignored** (continuing from Step 4). Added to Known Limitations.
 
 **Acceptance:**
-- Game runs with HD sprites visible: Mario is chunky-BG + crisp-HD-sprite (if you've painted a Mario HD sheet). Palette changes (invincibility flash, fade-in) apply to HD sprites correctly.
-- No crash when loading a level whose sprites have no HD replacement: `sheet == 0xFF` → sprite simply doesn't render. (Acceptable failure mode for v1; Step 7 can fall back to upscaled SD for unmapped sprites if desired.)
+- With an HD Mario sheet in `gfx/hd/gfx32.png`: Mario renders crisply on top of the upscaled BG. Invincibility palette flash and level fade-in apply to HD Mario (via CGRAM + final-line brightness).
+- Left-facing / crouching Mario (hflip / vflip) render correctly — not mirrored per-sub-tile.
+- A sprite that spans Mario's Path-B region and a neighboring Path-A region renders both parts from their correct source sheets (test: a large Mario-adjacent sprite while Mario is mid-animation).
+- Sprites with no HD replacement (`HdVramMap_ResolveTile` fails, or `sheet_id`'s sheet isn't loaded) simply don't draw. No crash.
 
 ---
 
@@ -488,6 +633,9 @@ The PNG always has 128 tiles matching *source* layout. Since Path A writes one f
 - Color math (add/subtract subscreen), direct-color mode, color window math — not reproduced in the HD path. Most SMW gameplay doesn't use these for sprites; some effects (halo around Yoshi coins?) may look plainer.
 - Verification mismatch snapshots compare RAM, not pixels — HD output does not affect verification.
 - One uniform scale across all sheets in v1. Mixed-scale support is future work.
+- **OAM priority rotation** (`PPU_objPriority(ppu)` — `$2103` bit 7) is ignored. HD scene walks OAM `0..127` unconditionally. SMW gameplay rarely uses rotation; if a cutscene/title screen relies on it, HD layering will be wrong for that scene.
+- **Per-scanline brightness.** `ppu->brightnessMult` changes per scanline (HDMA on `$2100`). HD sprites all use the final-line value, so frame-wide fade effects are faithful but mid-frame brightness ramps are not. Typically cosmetic.
+- **BG-priority interleaving (restated).** See first bullet.
 
 ---
 
