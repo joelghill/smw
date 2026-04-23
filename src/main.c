@@ -19,6 +19,7 @@
 
 #include "types.h"
 #include "smw_rtl.h"
+#include "hd_compositor.h"
 #include "common_cpu_infra.h"
 #include "config.h"
 #include "util.h"
@@ -177,11 +178,16 @@ static SDL_HitTestResult HitTestCallback(SDL_Window *win, const SDL_Point *pt, v
 }
 
 void RtlDrawPpuFrame(uint8 *pixel_buffer, size_t pitch, uint32 render_flags) {
+  g_hd_skip_sprites = g_hd_enabled;
   g_rtl_game_info->draw_ppu_frame();
-  
+
   uint8 *ppu_pixels = g_other_image ? g_my_pixels : g_pixels;
-  for (size_t y = 0, y_end = g_snes_height; y < y_end; y++)
-    memcpy((uint8 *)pixel_buffer + y * pitch, ppu_pixels + y * 256 * 4, 256 * 4);
+  if (g_hd_enabled) {
+    HdCompositor_Draw(pixel_buffer, pitch, ppu_pixels, g_snes_width, g_snes_height);
+  } else {
+    for (size_t y = 0, y_end = g_snes_height; y < y_end; y++)
+      memcpy((uint8 *)pixel_buffer + y * pitch, ppu_pixels + y * 256 * 4, 256 * 4);
+  }
 }
 
 static void DrawPpuFrameWithPerf(void) {
@@ -256,6 +262,8 @@ static void SDLCALL AudioCallback(void *userdata, Uint8 *stream, int len) {
 static SDL_Renderer *g_renderer;
 static SDL_Texture *g_texture;
 static SDL_Rect g_sdl_renderer_rect;
+static int g_texture_width;
+static int g_texture_height;
 
 static bool SdlRenderer_Init(SDL_Window *window) {
   if (g_config.shader)
@@ -283,8 +291,10 @@ static bool SdlRenderer_Init(SDL_Window *window) {
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "best");
 
   int tex_mult = 1;
+  g_texture_width = g_snes_width * tex_mult;
+  g_texture_height = g_snes_height * tex_mult;
   g_texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
-                                g_snes_width * tex_mult, g_snes_height * tex_mult);
+                                g_texture_width, g_texture_height);
   if (g_texture == NULL) {
     printf("Failed to create texture: %s\n", SDL_GetError());
     return false;
@@ -298,6 +308,17 @@ static void SdlRenderer_Destroy(void) {
 }
 
 static void SdlRenderer_BeginDraw(int width, int height, uint8 **pixels, int *pitch) {
+  if (width != g_texture_width || height != g_texture_height) {
+    SDL_DestroyTexture(g_texture);
+    g_texture_width = width;
+    g_texture_height = height;
+    g_texture = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
+                                  width, height);
+    if (g_texture == NULL) {
+      printf("Failed to recreate texture: %s\n", SDL_GetError());
+      return;
+    }
+  }
   g_sdl_renderer_rect.w = width;
   g_sdl_renderer_rect.h = height;
   if (SDL_LockTexture(g_texture, &g_sdl_renderer_rect, (void **)pixels, pitch) != 0) {
@@ -464,6 +485,7 @@ error_reading:;
 
   PpuBeginDrawing(g_snes->ppu, g_pixels, 256 * 4, 0);
   PpuBeginDrawing(g_my_ppu, g_my_pixels, 256 * 4, 0);
+  HdCompositor_Init();
 
   if (g_config.save_playthrough)
     MkDir("playthrough");

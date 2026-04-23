@@ -82,7 +82,7 @@ extern bool   g_hd_skip_sprites;   // ppu.c reads this; when true, PpuDrawSprite
 
 ---
 
-## Step 1 — HD scale plumbing + stub compositor
+## Step 1 — HD scale plumbing + stub compositor ✅ DONE
 
 **Goal:** make the pipeline run at an HD scale with the existing SD output nearest-upscaled. No HD assets yet. Proves the plumbing works end-to-end.
 
@@ -122,9 +122,11 @@ extern bool   g_hd_skip_sprites;   // ppu.c reads this; when true, PpuDrawSprite
 - On-screen fonts ([src/main.c:210-213](src/main.c#L210-L213) `RenderNumber`) write into the HD buffer at SD-pitch positions, so they still work positionally but render tiny. Acceptable for v1.
 
 **Acceptance:**
-- Build clean.
-- Game window opens at HD scale (e.g. 4×). Backgrounds visible, chunky-upscaled. No sprites visible. Game plays (verified by Mario's inputs moving the camera, BG tiles scrolling).
-- Toggle `g_hd_enabled = false` at compile time → SD returns, sprites reappear.
+- ✅ Build clean.
+- ✅ Game window opens at HD scale (e.g. 4×). Backgrounds visible, chunky-upscaled. No sprites visible. Game plays (verified by Mario's inputs moving the camera, BG tiles scrolling).
+- ✅ Toggle `g_hd_enabled = false` at compile time → SD returns, sprites reappear.
+
+**Post-completion fix:** `SdlRenderer_BeginDraw` heap overflow — SDL texture was created at 256×224 but written at HD dimensions. Fixed by recreating the texture when dimensions change, mirroring `OpenGLRenderer_BeginDraw`.
 
 ---
 

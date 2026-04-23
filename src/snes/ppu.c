@@ -9,6 +9,7 @@
 
 #include "snes.h"
 #include "snes_regs.h"
+#include "../hd_compositor.h"
 
 
 extern bool g_new_ppu;
@@ -628,7 +629,7 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
   //  0: backdrop
 
   if (PPU_mode(ppu) == 1) {
-    if (ppu->lineHasSprites)
+    if (!g_hd_skip_sprites && ppu->lineHasSprites)
       PpuDrawSprites(ppu, y, sub, true);
 
     bool mosaic_size = PPU_mosaicSize(ppu) > 1;
@@ -1147,5 +1148,5 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
 }
 
 int PpuGetCurrentRenderScale(Ppu *ppu, uint32_t render_flags) {
-  return 1;
+  return g_hd_enabled ? g_hd_scale : 1;
 }
