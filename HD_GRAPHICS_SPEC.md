@@ -49,10 +49,10 @@ Read this Overview and Architecture before picking up any step.
 
 ### HD PNG format (from export_sheets.py)
 
-- RGBA PNG, tile grid is **16 tiles wide × 8 tiles tall** = 128 tiles per sheet.
-- Each source tile is 8×8 SNES pixels. At scale `S`, tile is `8S × 8S` pixels, sheet is `128S × 64S`.
+- RGBA PNG, tile grid is **16 tiles wide × N tiles tall** (N ≥ 1). Width is fixed at 16 tiles; height is variable per sheet.
+- Each source tile is 8×8 SNES pixels. At scale `S`, tile is `8S × 8S` pixels, sheet is `128S × (8S·N)` pixels, sheet holds `16·N` tiles.
 - Per pixel: R == G == B == `grey`; alpha 0 means transparent (palette index 0). Otherwise `index = round(grey * max / 255)` where `max = 15` for 4bpp sprites.
-- "Scale" = HD PNG width / 128. Must be a positive integer.
+- "Scale" = HD PNG width / 128. Must be a positive integer. Height must be a positive multiple of `8S`.
 - Sprites in SMW are always 4bpp (OBJ tiles). Indices 0..15. Index 0 = transparent.
 
 ### Global state additions (cross-cutting)
@@ -74,7 +74,7 @@ extern bool   g_hd_skip_sprites;   // ppu.c reads this; when true, PpuDrawSprite
 
 - **SD**: 256 × 224 (or 240) native SNES resolution, 4 BGRA bytes per pixel.
 - **HD**: `256·S × 224·S`, `S ∈ {2, 3, 4, 6, 8, ...}`.
-- **Sheet**: one of the ~52 SMW GFX slots (`gfx00.png` … `gfx33.png`), each 128 tiles.
+- **Sheet**: one of the ~52 SMW GFX slots (`gfx00.png` … `gfx33.png`). Always 16 tiles wide; tile-row count is per-sheet.
 - **Tile**: 8×8 native pixel block. In an HD sheet, `8S × 8S` pixels.
 - **Slot→VRAM mapping**: record of which sheet last uploaded to each VRAM tile address.
 - **Scene**: per-frame list of sprite draw calls derived from OAM.
@@ -144,9 +144,10 @@ extern bool   g_hd_skip_sprites;   // ppu.c reads this; when true, PpuDrawSprite
 2. Create `src/hd_gfx.h`:
    ```c
    typedef struct HdSheet {
-     uint8 *index_buffer;   // scale*128 * scale*64 bytes; one index per HD pixel; 0 = transparent
-     uint16 width;          // scale * 128
-     uint16 height;         // scale * 64
+     uint8 *index_buffer;   // width*height bytes; one index per HD pixel; 0 = transparent
+     uint16 width;          // scale * 128 (always 16 tiles wide)
+     uint16 height;         // scale * 8 * num_tile_rows (variable per sheet)
+     uint16 tile_count;     // total 8x8 tiles in the sheet = (width / 8S) * (height / 8S) = 16 * num_tile_rows
      uint8  scale;          // 1..N
      bool   loaded;
    } HdSheet;
@@ -162,11 +163,11 @@ extern bool   g_hd_skip_sprites;   // ppu.c reads this; when true, PpuDrawSprite
    - `HdGfx_LoadAll("gfx/hd")`:
      - For i = 0..0x33: try `gfx/hd/gfx%02x.png`. If missing, `loaded = false`, continue.
      - Use `stb_image.h` to decode as RGBA.
-     - Validate: `width % 128 == 0`, `height % 64 == 0`, `width/128 == height/64`, scale ≥ 1. If validation fails, warn via `fprintf(stderr, ...)` and skip.
+     - Validate: `width % 128 == 0`, `scale = width / 128 ≥ 1`, `height % (8 * scale) == 0`, `height ≥ 8 * scale`. If validation fails, warn via `fprintf(stderr, ...)` and skip.
      - Allocate `index_buffer = malloc(width * height)`; for each pixel convert `(r, a)` → index:
        - If `a == 0`: `index = 0`.
        - Else: `index = (r * 15 + 127) / 255;` (round to nearest; matches `round(grey * 15 / 255)` from the encoder).
-     - Populate `HdSheet` and mark `loaded = true`. Log sheet id, dims, scale.
+     - Populate `HdSheet` (including `tile_count = (width / (8*scale)) * (height / (8*scale)) = 16 * (height / (8*scale))`) and mark `loaded = true`. Log sheet id, dims, scale.
    - Determine effective global scale: set `g_hd_scale` (from Step 1) to the max scale across loaded sheets, or fall back to 1 if none loaded. (Multiple scales coexist at compositor time; the frame buffer is sized to the maximum.)
    - **Or** require a single uniform scale — simpler for v1. Go with uniform: first loaded sheet's scale sets `g_hd_scale`; reject other-scaled sheets with a warning.
    - `HdGfx_Free`: free every non-null `index_buffer`.
@@ -176,7 +177,7 @@ extern bool   g_hd_skip_sprites;   // ppu.c reads this; when true, PpuDrawSprite
 - `stb_image` is single-header; exactly one `.c` must `#define STB_IMAGE_IMPLEMENTATION` before the include. Do this in `src/hd_gfx.c`.
 - Reject non-integer scale (e.g., a 1023×512 PNG). Log and skip.
 - Don't crash on PNGs with indexed color mode — stb_image expands to RGBA automatically.
-- HD sheets are large: scale=8 → 1024×512 bytes = 512KB × 52 = ~27MB RAM. Acceptable.
+- HD sheets are large: at scale=8, one `16 × N`-tile sheet uses `1024 × 64·N` bytes (e.g. N=8 → 512 KB). A full set of 52 stacked 8-row sheets is ~27 MB; variable-height sheets scale linearly with row count. Acceptable.
 - The tile index layout within a sheet matches source: row-major, 16 tiles per row. Store flat (no per-tile chunking); compositor computes tile offsets on the fly.
 
 **Acceptance:**
@@ -221,7 +222,7 @@ Primary mechanism is a **direct hook inside `UploadGraphicsFiles_UploadGFXFile`*
 
 Secondary mechanism is a **staging-buffer registry + `SmwCopyToVram` hook** for dynamic Mario tiles. Register `g_ram + 0x2000` as sheet 0x32's staging base at the point `DecompressGFX32And33` runs. `SmwCopyToVram` looks up its `src` pointer in the registry; if it falls inside a staging range, record a region; otherwise skip (not sheet data). Mario's `0x64a0/0x65a0` uploads from `g_ram + 0xbf6/0xcb6` also fall outside the `g_ram + 0x2000` range — either register a second Mario staging range (if that RAM area is a stable mirror) or accept those slots as unmapped in v1 and fall back to SD.
 
-The PNG always has 128 tiles matching *source* layout. Since Path A writes one full sheet (128 tiles) contiguously, `tile_in_sheet = (vram_word_addr - region_base) / 16`. For Path B, both source and destination are 4bpp (32 B/tile), so the same formula works (just computed on the RAM staging side).
+The PNG is laid out in source-tile order, 16 tiles per row. Path A always writes 128 VRAM tiles contiguously, so VRAM-tile N maps to sheet-tile N (for N < `sheet->tile_count`); sheets with fewer than 128 tiles leave the tail unmapped (fall back to SD), and sheets with more than 128 tiles have their extra tiles unreachable from a single bulk region. In both paths `tile_in_sheet = (vram_word_addr - region_base) / 16` — no bpp arithmetic needed (Path A is 4bpp at the VRAM side; Path B is 4bpp on both sides).
 
 **Tasks:**
 
@@ -472,10 +473,11 @@ for (int row = 0; row < s->size; row++) {
     // Uniform-scale invariant from Step 2.
     assert(sheet->scale == S);
 
-    // HD sheet coords of the tile's top-left:
+    // HD sheet coords of the tile's top-left. Sheets are always 16 tiles wide
+    // (width = 128*S); height is variable per sheet — see sheet->tile_count.
+    if (tile_in_sheet >= sheet->tile_count) continue;  // out-of-sheet reference — skip
     int tx = (tile_in_sheet & 0xf) * 8 * S;
-    int ty = (tile_in_sheet >> 4)  * 8 * S;   // tile_in_sheet must be < 128 (sheet holds 0..127)
-    if (tile_in_sheet >= 128) continue;       // out-of-sheet reference — skip
+    int ty = (tile_in_sheet >> 4)  * 8 * S;
 
     // HD pixel range for this (row, col) = one SD pixel = S×S HD pixels.
     for (int py = 0; py < S; py++) {
@@ -505,7 +507,7 @@ for (int row = 0; row < s->size; row++) {
 Notes on the code above:
 - **Flip handling.** Both the tile-select (`tile_row_src`, `tile_col_src`) and the within-tile offset (`y_in_tile_sd`, `x_in_tile_sd`) derive from `srcRow`/`srcCol`, which have the flip already applied. This matches ppu.c: [ppu.c:792](src/snes/ppu.c#L792) flips `row` before the sub-tile loop, and [ppu.c:807](src/snes/ppu.c#L807) flips `col` via `usedCol`. Getting either one wrong breaks flipped large sprites (all of Mario's left-facing frames).
 - **Per-sub-tile VRAM resolution.** `HdVramMap_ResolveTile` runs once per SD pixel. That's 64 resolves per 8×8 sub-tile — acceptable at v1 scale. If profiling shows it matters, hoist the resolve out to an `(8×8)` sub-tile loop.
-- **Mask to sheet.** `tile_in_sheet >= 128` means the sprite referenced VRAM tiles past the end of a recorded region's sheet. Treat as unmapped and skip.
+- **Mask to sheet.** Sheet tile count is variable (Step 2 accepts any positive number of 8-row tile rows; width is fixed at 16 tiles). `tile_in_sheet >= sheet->tile_count` means the sprite referenced VRAM tiles past the end of a recorded region's sheet — treat as unmapped and skip. Do **not** hard-code 128 here.
 - **BGRA byte order.** Matches [ppu.c:709](src/snes/ppu.c#L709): R in bits 16-23, G in 8-15, B in 0-7. Alpha set to 0xff on every sprite pixel (BG upscale leaves alpha = 0; setting alpha here prepares for Step 6's blend).
 - **Sheet scale invariant.** Step 2 rejects sheets whose scale doesn't match `g_hd_scale`; the assert is a debug safety net.
 
@@ -531,7 +533,7 @@ void HdCompositor_Draw(uint8 *dst, size_t pitch,
 ### Performance hoisting
 
 Inside the per-sprite function:
-- Hoist `sheet`, `sheet->index_buffer`, `sheet->width`, `palette_base`, `cgram`, `bmult` out of inner loops.
+- Hoist `sheet`, `sheet->index_buffer`, `sheet->width`, `sheet->tile_count`, `palette_base`, `cgram`, `bmult` out of inner loops.
 - Hoist sub-tile resolve if profiling demands it (resolve once per 8×8 sub-tile; store `sheet_id`, `tile_in_sheet` in locals; loop the 8×8 SD pixels × S² HD pixels).
 - Don't attempt SIMD in v1.
 
