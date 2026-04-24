@@ -10,10 +10,16 @@ means the HD sheet is resolution-independent with respect to palette: one
 greyscale sheet serves every in-game palette variant.
 
 Encoding
-  Pixel's palette index (0..max, where max = 2**bpp - 1) is written as
-  grey = index * 255 // max in all three RGB channels. Index 0 is fully
-  transparent (alpha 0) to mark sprite/BG transparency. Round-trip is
-  index = round(grey * max / 255).
+  Palette indices are encoded with grey = index * 17 in all three RGB
+  channels (i.e. 4bpp spacing: max_idx = 15). Index 0 is fully transparent
+  (alpha 0) to mark sprite/BG transparency. Round-trip is
+  index = round(grey * 15 / 255).
+
+  The runtime always addresses CGRAM as 4bpp (16-entry palettes) regardless
+  of the source sheet's bpp — 3bpp sheets are inflated to 4bpp at VRAM
+  upload, and their used indices remain 0..7 in a 16-entry palette slot.
+  Encoding at a fixed 4bpp step means a 3bpp source index 1 is grey 17
+  (not 36), so the loader decodes it back to index 1 rather than index 2.
 
 Tile formats (per sneslab.net/wiki/Graphics_Format)
   2bpp (16 B/tile): bp1+bp2 intertwined row-by-row.
@@ -81,7 +87,9 @@ def gfx_to_greyscale_image(tile_data, bpp=4, tiles_wide=16):
     if num_tiles == 0:
         return None
 
-    max_idx = (1 << bpp) - 1
+    # Always encode at 4bpp spacing: the runtime inflates 3bpp VRAM tiles to
+    # 4bpp and addresses 16-entry palettes, so a 3bpp source index N must
+    # land at grey = N * 17 (not N * 255/7) to round-trip correctly.
     rows = (num_tiles + tiles_wide - 1) // tiles_wide
     img = Image.new('RGBA', (tiles_wide * 8, rows * 8), (0, 0, 0, 0))
     pix = img.load()
@@ -95,7 +103,7 @@ def gfx_to_greyscale_image(tile_data, bpp=4, tiles_wide=16):
                 if ci == 0:
                     pix[tx + px, ty + py] = (0, 0, 0, 0)
                 else:
-                    g = ci * 255 // max_idx
+                    g = ci * 17
                     pix[tx + px, ty + py] = (g, g, g, 255)
 
     return img
@@ -133,28 +141,43 @@ def export_sheets(export_dir):
             print(f'  gfx{i:02x}: empty, skipped')
             continue
         path = os.path.join(source_dir, f'gfx{i:02x}.png')
-        img = img.resize((img.width * 8, img.height * 8), Image.NEAREST)
+        img = img.resize((img.width * 4, img.height * 4), Image.NEAREST)
         img.save(path)
         num_tiles = len(tile_data) // _TILE_BYTES[bpp]
         print(f'  gfx{i:02x}.png  {num_tiles:3d} tiles  {bpp}bpp  {img.width}x{img.height}')
         exported += 1
 
-    # --- GFX 0x32 (Mario body) and 0x33 (Mario alt) are native 4bpp ---
+    # --- GFX 0x32 (Mario body, native 4bpp) ---
+    # --- GFX 0x33 (Mario alt / Yoshi, 3bpp in ROM) ---
+    # gfx33 is stored 3bpp in the vanilla ROM.  The inflation loop in
+    # GraphicsDecompressionRoutines_DecompressGFX32And33 reads the source
+    # buffer high→low while the destination pointer also travels high→low,
+    # so both pointers move in lockstep.  Tracing a single tile confirms:
+    #   - The LAST 3bpp tile (ROM tile N-1) is processed first and lands at
+    #     the HIGHEST 4bpp output addresses (g_ram+0xace0..0xacff = tile N-1).
+    #   - The FIRST 3bpp tile (ROM tile 0) is processed last and lands at
+    #     the LOWEST output addresses (g_ram+0x7d00..0x7d1f = tile 0).
+    # Tile order is therefore PRESERVED: inflated tile i == ROM tile i.
+    # Within each tile, the row order is also preserved (row 0 at the lowest
+    # address) because the reversed-read, reversed-write cancel out.
+    # No reordering is needed here; export tile i must equal inflated tile i
+    # so that HdVramMap_RecordCopyFromStaging resolves Yoshi uploads correctly.
     for gfx_id, word_addr, label in [
         (0x32, 0xB8D8, 'Mario body'),
-        (0x33, 0xB88B, 'Mario alt'),
+        (0x33, 0xB88B, 'Mario alt / Yoshi'),
     ]:
         addr      = 0x80000 | util.get_word(word_addr)
         tile_data = decomp_data(addr)
-        img       = gfx_to_greyscale_image(tile_data, 4, tiles_wide)
+        bpp       = 4 if gfx_id == 0x32 else _detect_bpp(len(tile_data))
+        img = gfx_to_greyscale_image(tile_data, bpp, tiles_wide)
         if img is None:
             print(f'  gfx{gfx_id:02x}: empty, skipped')
             continue
         path = os.path.join(source_dir, f'gfx{gfx_id:02x}.png')
-        img = img.resize((img.width * 8, img.height * 8), Image.NEAREST)
+        img = img.resize((img.width * 4, img.height * 4), Image.NEAREST)
         img.save(path)
-        num_tiles = len(tile_data) // 32
-        print(f'  gfx{gfx_id:02x}.png  {num_tiles:3d} tiles  4bpp  {img.width}x{img.height}  ({label})')
+        num_tiles = len(tile_data) // _TILE_BYTES[bpp]
+        print(f'  gfx{gfx_id:02x}.png  {num_tiles:3d} tiles  {bpp}bpp  {img.width}x{img.height}  ({label})')
         exported += 1
 
     print(f'\nExported {exported} sheets to {source_dir}/')

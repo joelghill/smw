@@ -4,6 +4,8 @@
 #include "variables.h"
 #include "assets/smw_assets.h"
 #include "hd_vram_map.h"
+#include "common_cpu_infra.h"
+#include "snes/snes.h"
 
 static FuncV *const kInitAndMainLoop_GameModePtrs[42] = {
     &GameMode00_LoadNintendoPresents,
@@ -2306,6 +2308,34 @@ const uint16 *GetPlayerPalette() {
 }
 
 void UploadPlayerGFX() {  // 00a300
+  // Diagnostic: dump Yoshi tile buffer to yoshi_dump.txt once it's non-zero.
+  static bool yoshi_buf_dumped = false;
+  if (!yoshi_buf_dumped && g_ram[0x8500] != 0) {
+    yoshi_buf_dumped = true;
+    FILE *_f = fopen("yoshi_dump.txt", "w");
+    if (_f) {
+      fprintf(_f, "g_ram[0x8500] first 128 bytes (4 tiles):\n");
+      for (int _i = 0; _i < 128; _i++) {
+        fprintf(_f, "%02x%s", g_ram[0x8500 + _i], (_i % 32 == 31) ? "\n" : " ");
+      }
+      // Search ROM for first 8 bytes of tile 0
+      if (g_rom && g_snes) {
+        uint32 _rom_size = g_snes->cart->romSize;
+        const uint8 *needle = g_ram + 0x8500;
+        bool _any = false;
+        for (uint32 _off = 0; _off + 8 < _rom_size; _off++) {
+          if (g_rom[_off] == needle[0] && memcmp(g_rom + _off, needle, 8) == 0) {
+            uint32 _bank = _off / 0x8000;
+            uint32 _addr = 0x8000 + (_off % 0x8000);
+            fprintf(_f, "ROM match at file_off=0x%x SNES=$%02x:%04x\n", _off, _bank, _addr);
+            _any = true;
+          }
+        }
+        if (!_any) fprintf(_f, "No ROM match found (buffer may be zero or runtime-computed)\n");
+      }
+      fclose(_f);
+    }
+  }
   if (player_number_of_tiles_to_update) {
     RtlUpdatePalette(GetPlayerPalette(), 0x86, 10);
   }
@@ -2765,6 +2795,22 @@ void UploadGraphicsFiles_UploadGFXFile(uint16 dst_addr, uint8 j, uint8 index) { 
   // can resolve OAM tile addresses back to (sheet_id, tile_in_sheet).
   if (j != 0xFF && !lunar_magic_upload_hack)
     HdVramMap_RecordSheetUpload(dst_addr, j, 0, 128);
+
+  // Yoshi dynamic GFX staging: the game uploads per-frame Yoshi tiles to
+  // SP1 via SmwCopyToVram(0x6060, g_ram + 32*charnum + 0x8500, 0x40).
+  // g_ram+0x8500 is the Yoshi animation tile buffer; it holds the inflated
+  // 4bpp tile data for each animation frame, indexed by charnum (0..0x10).
+  // The buffer is always populated from GFX0E (the dedicated Yoshi sprite
+  // sheet) regardless of which GFX slot occupies SP1 for the current level.
+  // In RM_BOTH, the SNES emulator fills this via the before-snapshot; in
+  // RM_MINE we copy from VRAM when GFX0E is the SP1 slot.
+  // Always register this buffer as staging for sheet 0x0E so Path-B can
+  // map each per-frame upload back to the correct tile in gfx0e.png.
+  // if (dst_addr == 0x6000 && !lunar_magic_upload_hack) {
+  //   if (j == 0x0E)
+  //     SmwCopyFromVram(0x6000, g_ram + 0x8500, 128 * 32);
+  //   HdVramMap_RegisterStaging(0x0E, g_ram + 0x8500, 128 * 32, 0);
+  // }
 }
 
 void ConvertGFX27IntoNormallFormat(uint16 *dst) {  // 00ab42
@@ -3020,6 +3066,8 @@ void GraphicsDecompressionRoutines_DecompressGFX32And33() {  // 00b888
   if (HAS_LM_FEATURE(kLmFeature_4bppgfx)) {
     memcpy(g_ram + 0x7d00, kGfx33, kGfx33_SIZE);
     memcpy(g_ram + 0x2000, kGfx32, kGfx32_SIZE);
+    HdVramMap_RegisterStaging(0x32, g_ram + 0x2000, kGfx32_SIZE, 0);
+    HdVramMap_RegisterStaging(0x33, g_ram + 0x7d00, kGfx33_SIZE, 0);
   } else {
     memcpy(g_ram + 0x2000, kGfx33, kGfx33_SIZE);
     uint8 *t8d = g_ram + 0xacfe;
@@ -3045,6 +3093,11 @@ void GraphicsDecompressionRoutines_DecompressGFX32And33() {  // 00b888
     // Register the Mario staging buffer so SmwCopyToVram uploads from
     // g_ram+0x2000 can be mapped back to sheet 0x32.
     HdVramMap_RegisterStaging(0x32, g_ram + 0x2000, kGfx32_SIZE, 0);
+    // Register the inflated GFX33 buffer.  The 3bpp→4bpp inflation loop
+    // above writes 0x3000 bytes (384 tiles × 32 B) from g_ram+0x7d00 up to
+    // g_ram+0xacff.  Yoshi's per-frame uploads source from g_ram+0x8500+
+    // which is offset 0x800 (= tile 64) into this buffer.
+    HdVramMap_RegisterStaging(0x33, g_ram + 0x7d00, 0x3000, 0);
   }
 }
 

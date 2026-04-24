@@ -92,22 +92,16 @@ void HdVramMap_RecordCopyFromStaging(uint16 dst_word_addr, const uint8 *src,
     break;
   }
 
-  // Source not in any registered staging buffer.  If the destination is in
-  // SP1 (VRAM 0x6000–0x67FF — SMW's dynamic Mario/Yoshi slot), we still know
-  // the content is sheet-0x32 data by convention: SP1 VRAM tile N corresponds
-  // 1:1 to sheet-0x32 tile N (Mario charnums 0x00..0x7F reference sheet 0x32
-  // tiles 0..127 directly).  This covers RestoreSP1 (g_ram + 0xbf6/0xcb6) and
-  // Yoshi (g_ram + 0x8500+) uploads, whose source RAM layouts we can't map
-  // generically.  Without this, those tiles would fall through to the Path-A
-  // sheet-0x00 recording and render from the wrong HD sheet.
-  if (rec_sheet_id == 0xFF) {
-    if (dst_word_addr >= 0x6000 && dst_word_addr < 0x6800) {
-      rec_sheet_id    = 0x32;
-      rec_tile_offset = (uint16)((dst_word_addr - 0x6000) / 16);
-    } else {
-      return;
-    }
-  }
+  // Source not in any registered staging buffer: don't record a region.
+  // ResolveTile will fall back to the most-recent Path-A bulk upload covering
+  // this VRAM address, which is the level's current sprite GFX sheet — the
+  // right answer for Yoshi dynamic-tile uploads (g_ram + 0x8500+), RestoreSP1
+  // (g_ram + 0xbf6/0xcb6), and any other unregistered source writing into an
+  // already-populated sprite page.  Hardcoding sheet 0x32 here (as earlier
+  // versions did) mapped every SP1 write onto Mario's sheet, which is only
+  // correct for Mario himself.
+  if (rec_sheet_id == 0xFF)
+    return;
 
   uint16 tile_count = (uint16)(byte_count / 32);
   if (tile_count == 0)

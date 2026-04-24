@@ -5,6 +5,7 @@
 #include "common_rtl.h"
 #include "snes/ppu.h"
 #include <stdint.h>
+#include <stdio.h>
 
 static HdScene g_hd_scene;
 
@@ -12,6 +13,7 @@ static HdScene g_hd_scene;
 static void HdCompositor_DrawSprites(uint8 *hd_buf, size_t hd_pitch,
                                      int hd_width, int hd_height,
                                      const Ppu *ppu);
+static void HdCompositor_DebugDump(const HdScene *scene);
 
 bool  g_hd_enabled      = true;
 uint8 g_hd_scale        = 1;
@@ -37,6 +39,9 @@ void HdCompositor_Draw(uint8 *dst, size_t pitch,
 
   // Build the HD sprite scene from current PPU OAM state.
   HdScene_Build(&g_hd_scene, g_my_ppu);
+
+  // Periodic always-on diagnostic dump (~once per second at 60fps).
+  HdCompositor_DebugDump(&g_hd_scene);
 
   // Composite HD sprites on top of the upscaled BG.
   if (g_hd_scale > 1) {
@@ -152,4 +157,82 @@ static void HdCompositor_DrawSprites(uint8 *hd_buf, size_t hd_pitch,
       }
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Always-on diagnostic dump.  Runs ~once per second.  Prints the VRAM map
+// and, for each visible HD scene sprite, how many of its sub-tiles resolved
+// against the map and what (sheet_id, tile_in_sheet) the first resolved tile
+// landed on.  No build-type gating — fprintf to stderr.
+// ---------------------------------------------------------------------------
+static void HdCompositor_DebugDump(const HdScene *scene) {
+  static unsigned frame_counter = 0;
+  if (++frame_counter % 60 != 0) return;  // ~1 Hz at 60fps
+
+  fprintf(stderr, "\n----- HD Debug @ frame %u  (scene count=%u, hd_scale=%u) -----\n",
+          frame_counter, scene->count, g_hd_scale);
+  HdVramMap_Dump();
+
+  fprintf(stderr, "----- Scene -----\n");
+  for (int i = 0; i < scene->count; i++) {
+    const HdSprite *s = &scene->sprites[i];
+    int    num_tiles  = s->size >> 3;
+    uint16 objAdr     = (uint16)((s->tile_vram - (uint16)s->tile_num * 16) & 0x7fff);
+    uint8  tile_hi    = s->tile_num >> 4;
+    uint8  tile_lo    = s->tile_num & 0xf;
+
+    int    resolved   = 0;
+    int    unresolved = 0;
+    bool   sample_set = false;
+    uint8  s_sheet    = 0;
+    uint16 s_tile     = 0;
+    uint16 s_vram     = 0;
+    uint16 first_unresolved_vram = 0;
+    bool   any_unresolved = false;
+
+    for (int t_row = 0; t_row < num_tiles; t_row++) {
+      uint8 u_hi = (uint8)((tile_hi + t_row) & 0xff);
+      for (int t_col = 0; t_col < num_tiles; t_col++) {
+        uint8  u_lo      = (uint8)((tile_lo + t_col) & 0xf);
+        uint16 used_tile = ((uint16)u_hi << 4) | u_lo;
+        uint16 tv        = (uint16)((objAdr + used_tile * 16) & 0x7fff);
+
+        uint8  sheet_id;
+        uint16 tile_in_sheet;
+        if (HdVramMap_ResolveTile(tv, &sheet_id, &tile_in_sheet)) {
+          resolved++;
+          if (!sample_set) {
+            sample_set = true;
+            s_sheet    = sheet_id;
+            s_tile     = tile_in_sheet;
+            s_vram     = tv;
+          }
+        } else {
+          unresolved++;
+          if (!any_unresolved) {
+            any_unresolved        = true;
+            first_unresolved_vram = tv;
+          }
+        }
+      }
+    }
+
+    fprintf(stderr,
+            "  oam[%3d] xy=(%4d,%4d) sz=%2d pal=%u lay=%u flags=0x%x  "
+            "tile_num=0x%02x objAdr=0x%04x tile_vram=0x%04x  R=%d U=%d",
+            i, s->x, s->y, s->size, s->palette, s->layer, s->flags,
+            s->tile_num, objAdr, s->tile_vram, resolved, unresolved);
+
+    if (sample_set) {
+      const HdSheet *sh = &g_hd_sheets[s_sheet];
+      fprintf(stderr, "  first_R: vram=0x%04x -> gfx%02x tile=%u (loaded=%d, scale=%u, tiles=%u)",
+              s_vram, s_sheet, s_tile, sh->loaded, sh->scale, sh->tile_count);
+    }
+    if (any_unresolved) {
+      fprintf(stderr, "  first_U: vram=0x%04x", first_unresolved_vram);
+    }
+    fprintf(stderr, "\n");
+  }
+  fprintf(stderr, "----- End HD Debug -----\n");
+  fflush(stderr);
 }
