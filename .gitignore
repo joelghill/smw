@@ -19,4 +19,5 @@ __pycache__
 /gfx/hd/*
 /gfx/source/*
 /gfx/smoothed/*
+*.log
 
