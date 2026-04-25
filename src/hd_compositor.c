@@ -131,15 +131,19 @@ static void HdCompositor_DrawSprites(uint8 *hd_buf, size_t hd_pitch,
               int hd_sy = ty + src_yi * S;
 
               // Expand one SD pixel into an S×S HD block.
+              // When flipped, mirror the sub-pixel reads within the S×S block
+              // so that HD detail (slopes, curves) is correctly reversed.
               for (int py = 0; py < S; py++) {
-                int dst_y = out_y_base + py;
+                int dst_y  = out_y_base + py;
+                int src_py = vflip ? (S - 1 - py) : py;
                 if (dst_y < 0 || dst_y >= hd_height) continue;
                 uint32_t *dst_row =
                     (uint32_t *)((uint8 *)hd_buf + (size_t)dst_y * hd_pitch);
                 for (int px = 0; px < S; px++) {
-                  int dst_x = out_x_base + px;
+                  int dst_x  = out_x_base + px;
+                  int src_px = hflip ? (S - 1 - px) : px;
                   if (dst_x < 0 || dst_x >= hd_width) continue;
-                  uint8 index = idx_buf[(hd_sy + py) * sh_width + hd_sx + px];
+                  uint8 index = idx_buf[(hd_sy + src_py) * sh_width + hd_sx + src_px];
                   if (index == 0) continue;  // transparent
                   uint16 color = cgram[pal_base + index];
                   // CGRAM format: ..bbbbb ggggg rrrrr (R in low 5 bits).
