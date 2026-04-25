@@ -28,6 +28,13 @@ void HdVramMap_RecordSheetUpload(uint16 dst_word_addr, uint8 sheet_id,
 void HdVramMap_RecordCopyFromStaging(uint16 dst_word_addr, const uint8 *src,
                                      int byte_count);
 
+// Forget any path-B region with a matching (vram_word_addr, tile_count) so a
+// subsequent ResolveTile falls back to a covering bulk (Path-A) region.  Used
+// by the dynamic-Mario uploader when its per-tile pointer is zero: the VRAM
+// still gets a deterministic fill, but semantically nothing meaningful was
+// uploaded — let the bulk sheet underneath stay authoritative.
+void HdVramMap_ForgetRegion(uint16 vram_word_addr, uint16 tile_count);
+
 // Register a fixed RAM buffer as holding a known sheet (4bpp, 32 bytes/tile).
 // 'sheet_tile_base' is the index within the sheet of the first tile in the
 // buffer (usually 0).  Calling again with the same sheet_id updates the entry.

@@ -40,8 +40,8 @@ static const uint16 kDefaultKbdControls[kKeys_Total] = {
   _(SDLK_w), _(SDLK_q), S(SDLK_r),
   // ClearKeyLog, StopReplay, Fullscreen, Reset, Pause, PauseDimmed, Turbo, ReplayTurbo, WindowBigger, WindowSmaller, DisplayPerf, ToggleRenderer
   _(SDLK_k), _(SDLK_l), A(SDLK_RETURN), C(SDLK_r), S(SDLK_p), _(SDLK_p), _(SDLK_TAB), _(SDLK_t), N, N, _(SDLK_f), _(SDLK_r),
-  // VolumeUp VolumeDown
-  0, 0,
+  // VolumeUp VolumeDown ToggleHdGfx
+  0, 0, C(SDLK_h),
 };
 #undef _
 #undef A
@@ -62,7 +62,7 @@ static const KeyNameId kKeyNameId[] = {
   M(Load), M(Save), M(Replay), M(LoadRef), M(ReplayRef),
   S(CheatLife), S(CheatJump), S(ToggleWhichFrame),
   S(ClearKeyLog), S(StopReplay), S(Fullscreen), S(Reset),
-  S(Pause), S(PauseDimmed), S(Turbo), S(ReplayTurbo), S(WindowBigger), S(WindowSmaller), S(VolumeUp), S(VolumeDown), S(DisplayPerf), S(ToggleRenderer),
+  S(Pause), S(PauseDimmed), S(Turbo), S(ReplayTurbo), S(WindowBigger), S(WindowSmaller), S(VolumeUp), S(VolumeDown), S(DisplayPerf), S(ToggleRenderer), S(ToggleHdGfx),
 };
 #undef S
 #undef M
@@ -393,6 +393,37 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
     } else if (StringEqualsNoCase(key, "Shader")) {
       g_config.shader = *value ? value : NULL;
       return true;
+    } else if (StringEqualsNoCase(key, "HdGfxEnabled")) {
+      return ParseBool(value, &g_config.hd_gfx_enabled);
+    } else if (StringEqualsNoCase(key, "HdGfxDir")) {
+      g_config.hd_gfx_dir = value;
+      return true;
+    } else if (StringEqualsNoCase(key, "HdLayerShadow")) {
+      char *s;
+      for (int i = 0; i < 4 && (s = NextDelim(&value, ',')) != NULL; i++)
+        ParseBool(s, &g_config.hd_layer_shadow[i]);
+      return true;
+    } else if (StringEqualsNoCase(key, "HdShadowOffset")) {
+      char *s;
+      if ((s = NextDelim(&value, ',')) != NULL) g_config.hd_shadow_dx = (int16)strtol(s, NULL, 10);
+      if ((s = NextDelim(&value, ',')) != NULL) g_config.hd_shadow_dy = (int16)strtol(s, NULL, 10);
+      return true;
+    } else if (StringEqualsNoCase(key, "HdShadowAlpha")) {
+      g_config.hd_shadow_alpha = (uint8)strtol(value, NULL, 10);
+      return true;
+    } else if (StringEqualsNoCase(key, "HdShadowColor")) {
+      if (value[0] == '#') {
+        unsigned long rgb = strtoul(value + 1, NULL, 16);
+        g_config.hd_shadow_r = (uint8)((rgb >> 16) & 0xff);
+        g_config.hd_shadow_g = (uint8)((rgb >>  8) & 0xff);
+        g_config.hd_shadow_b = (uint8)((rgb >>  0) & 0xff);
+      } else {
+        char *s;
+        if ((s = NextDelim(&value, ',')) != NULL) g_config.hd_shadow_r = (uint8)strtol(s, NULL, 10);
+        if ((s = NextDelim(&value, ',')) != NULL) g_config.hd_shadow_g = (uint8)strtol(s, NULL, 10);
+        if ((s = NextDelim(&value, ',')) != NULL) g_config.hd_shadow_b = (uint8)strtol(s, NULL, 10);
+      }
+      return true;
     }
   } else if (section == 2) {
     if (StringEqualsNoCase(key, "EnableAudio")) {
@@ -480,6 +511,14 @@ static bool ParseOneConfigFile(const char *filename, int depth) {
 void ParseConfigFile(const char *filename) {
   g_config.msuvolume = 100;  // default msu volume, 100%
   g_config.save_playthrough = true;
+  g_config.hd_gfx_enabled = true;
+  g_config.hd_layer_shadow[0] = false;
+  g_config.hd_layer_shadow[1] = false;
+  g_config.hd_layer_shadow[2] = true;
+  g_config.hd_layer_shadow[3] = false;
+  g_config.hd_shadow_dx = 4;
+  g_config.hd_shadow_dy = 4;
+  g_config.hd_shadow_alpha = 128;
 
   if (filename != NULL || !ParseOneConfigFile("smw.user.ini", 0)) {
     if (filename == NULL)

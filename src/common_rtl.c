@@ -826,6 +826,12 @@ void SmwCopyToVram(uint16 vram_addr, const uint8 *src, int n) {
   HdVramMap_RecordCopyFromStaging(vram_addr, src, n);
 }
 
+void SmwCopyToVramNoMap(uint16 vram_addr, const uint8 *src, int n) {
+  for (size_t i = 0; i < (n >> 1); i++)
+    g_ppu->vram[vram_addr + i] = WORD(src[i * 2]);
+  HdVramMap_ForgetRegion(vram_addr, (uint16)(n / 32));
+}
+
 void SmwCopyToVramPitch32(uint16 vram_addr, const uint8 *src, int n) {
   for (size_t i = 0; i < (n >> 1); i++)
     g_ppu->vram[vram_addr + i * 32] = WORD(src[i * 2]);

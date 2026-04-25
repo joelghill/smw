@@ -11,7 +11,17 @@ static const uint8 spriteSizes[8][2] = {
 void HdScene_Build(HdScene *scene, const Ppu *ppu) {
   scene->count = 0;
 
-  for (int i = 0; i < 128; i++) {
+  // Mirror PPU OAM iteration order so the compositor draws sprites in the
+  // correct on-screen priority.  When OBJ priority rotation is enabled
+  // (OAMADDH bit 7), the PPU iterates starting at oamaddl with wraparound,
+  // and the *first* writer to a pixel wins (ppu.c:821).  The compositor
+  // draws scene entries in reverse (count-1 → 0) with overwrite semantics,
+  // so we record sprites in PPU iteration order: scene[0] is the
+  // highest-priority OAM entry and gets drawn last (on top), matching SD.
+  int start = (ppu->oamaddh & 0x80) ? ((ppu->oamaddl & 0xfe) >> 1) : 0;
+
+  for (int n = 0; n < 128; n++) {
+    int i = (start + n) & 0x7f;
     uint16 oam0 = ppu->oam[i * 2];
     uint16 oam1 = ppu->oam[i * 2 + 1];
 

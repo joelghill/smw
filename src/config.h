@@ -37,6 +37,7 @@ enum {
   kKeys_ToggleRenderer,
   kKeys_VolumeUp,
   kKeys_VolumeDown,
+  kKeys_ToggleHdGfx,
   kKeys_Total,
 };
 
@@ -81,6 +82,17 @@ typedef struct Config {
 
   // Which players have keyboard controls
   uint8 has_keyboard_controls;
+
+  // HD graphics
+  bool        hd_gfx_enabled;
+  const char *hd_gfx_dir;
+  bool        hd_layer_shadow[4];
+  int16       hd_shadow_dx;
+  int16       hd_shadow_dy;
+  uint8       hd_shadow_alpha;
+  uint8       hd_shadow_r;
+  uint8       hd_shadow_g;
+  uint8       hd_shadow_b;
 } Config;
 
 enum {

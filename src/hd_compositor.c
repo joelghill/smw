@@ -3,6 +3,7 @@
 #include "hd_scene.h"
 #include "hd_vram_map.h"
 #include "common_rtl.h"
+#include "config.h"
 #include "snes/ppu.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -73,9 +74,42 @@ static void HdCompositor_EnsureBuffers(int hd_w, int hd_h) {
   g_hd_buf_height = hd_h;
 }
 
+void HdCompositor_ApplyConfig(void) {
+  g_hd_enabled = g_config.hd_gfx_enabled;
+  for (int i = 0; i < 4; i++) {
+    g_hd_layer_cfg[i].shadow_enabled = g_config.hd_layer_shadow[i];
+    g_hd_layer_cfg[i].shadow_dx    = g_config.hd_shadow_dx;
+    g_hd_layer_cfg[i].shadow_dy    = g_config.hd_shadow_dy;
+    g_hd_layer_cfg[i].shadow_alpha = g_config.hd_shadow_alpha;
+    g_hd_layer_cfg[i].shadow_r     = g_config.hd_shadow_r;
+    g_hd_layer_cfg[i].shadow_g     = g_config.hd_shadow_g;
+    g_hd_layer_cfg[i].shadow_b     = g_config.hd_shadow_b;
+  }
+}
+
+void HdCompositor_Shutdown(void) {
+  free(g_hd_layer_buf);
+  free(g_hd_shadow_buf);
+  g_hd_layer_buf  = NULL;
+  g_hd_shadow_buf = NULL;
+  g_hd_buf_width  = 0;
+  g_hd_buf_height = 0;
+}
+
+bool HdCompositor_Toggle(void) {
+  g_hd_enabled = !g_hd_enabled;
+  return g_hd_enabled;
+}
+
 void HdCompositor_Init(void) {
+  HdCompositor_ApplyConfig();
   HdVramMap_Reset();
-  HdGfx_LoadAll("gfx/hd");
+  const char *hd_dir = g_config.hd_gfx_dir ? g_config.hd_gfx_dir : "gfx/hd";
+  HdGfx_LoadAll(hd_dir);
+  if (g_hd_enabled && g_hd_scale <= 1) {
+    fprintf(stderr, "HD enabled but no HD sheets loaded from '%s' "
+                    "(scale=1); falling back to SD.\n", hd_dir);
+  }
 }
 
 void HdCompositor_Draw(uint8 *dst, size_t pitch,

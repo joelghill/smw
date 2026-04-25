@@ -128,6 +128,18 @@ void HdVramMap_RecordCopyFromStaging(uint16 dst_word_addr, const uint8 *src,
   }
 }
 
+void HdVramMap_ForgetRegion(uint16 vram_word_addr, uint16 tile_count) {
+  for (int j = g_region_count - 1; j >= 0; j--) {
+    if (g_regions[j].vram_word_addr == vram_word_addr &&
+        g_regions[j].tile_count == tile_count) {
+      for (int k = j; k < g_region_count - 1; k++)
+        g_regions[k] = g_regions[k + 1];
+      g_region_count--;
+      return;
+    }
+  }
+}
+
 bool HdVramMap_ResolveTile(uint16 vram_word_addr, uint8 *sheet_out,
                            uint16 *tile_out) {
   // Pick the most specific overlapping region (smallest tile_count wins).

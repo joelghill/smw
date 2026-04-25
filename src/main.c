@@ -181,11 +181,12 @@ static SDL_HitTestResult HitTestCallback(SDL_Window *win, const SDL_Point *pt, v
 }
 
 void RtlDrawPpuFrame(uint8 *pixel_buffer, size_t pitch, uint32 render_flags) {
-  g_hd_skip_sprites = g_hd_enabled;
+  bool hd_active = g_hd_enabled && g_hd_scale > 1;
+  g_hd_skip_sprites = hd_active;
   g_rtl_game_info->draw_ppu_frame();
 
   uint8 *ppu_pixels = g_other_image ? g_my_pixels : g_pixels;
-  if (g_hd_enabled) {
+  if (hd_active) {
     HdCompositor_Draw(pixel_buffer, pitch, ppu_pixels, g_snes_width, g_snes_height);
   } else {
     for (size_t y = 0, y_end = g_snes_height; y < y_end; y++)
@@ -634,6 +635,7 @@ error_reading:;
   free(g_audiobuffer);
 
   g_renderer_funcs.Destroy();
+  HdCompositor_Shutdown();
   HdGfx_Free();
 
 #ifdef __SWITCH__
@@ -769,6 +771,11 @@ static void HandleCommand(uint32 j, bool pressed) {
       break;
     case kKeys_VolumeUp:
     case kKeys_VolumeDown: HandleVolumeAdjustment(j == kKeys_VolumeUp ? 1 : -1); break;
+    case kKeys_ToggleHdGfx: {
+      bool now = HdCompositor_Toggle();
+      fprintf(stderr, "HD graphics: %s\n", now ? "ON" : "OFF");
+      break;
+    }
     default: assert(0);
     }
   }

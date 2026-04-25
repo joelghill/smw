@@ -16,6 +16,11 @@ void SmwVectorIRQ();
 void SmwSavePlaythroughSnapshot();
 
 void SmwCopyToVram(uint16 vram_addr, const uint8 *src, int n);
+// Same VRAM write as SmwCopyToVram, but without registering a path-B HD VRAM
+// region — and any existing path-B region at this (vram, tile_count) is
+// dropped.  Use when the source data is a deterministic placeholder (e.g. the
+// dynamic-Mario uploader's t==0 fallback) rather than meaningful sheet data.
+void SmwCopyToVramNoMap(uint16 vram_addr, const uint8 *src, int n);
 void SmwClearVram(uint16 vram_addr, uint16 value, int n);
 void SmwCopyToVramPitch32(uint16 vram_addr, const uint8 *src, int n);
 void SmwCopyToVramLow(uint16 vram_addr, const uint8 *src, int n);

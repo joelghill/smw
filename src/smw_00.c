@@ -2344,7 +2344,10 @@ void UploadPlayerGFX() {  // 00a300
   uint8 v0 = 0;
   do {
     uint16 t = *(uint16 *)&graphics_dynamic_sprite_pointers_top_lo[v0];
-    SmwCopyToVram(0x6000 + v0 * 0x10, g_ram + (t ? t : 0x2000), 0x40);
+    if (t)
+      SmwCopyToVram(0x6000 + v0 * 0x10, g_ram + t, 0x40);
+    else
+      SmwCopyToVramNoMap(0x6000 + v0 * 0x10, g_ram + 0x2000, 0x40);
     v0 += 2;
   } while (v0 < player_number_of_tiles_to_update);
 
@@ -2352,7 +2355,10 @@ void UploadPlayerGFX() {  // 00a300
   do {
     uint16 t = *(uint16 *)&graphics_dynamic_sprite_pointers_bottom_lo[v1];
     // bugfix to make predictable behavior
-    SmwCopyToVram(0x6100 + v1 * 0x10, g_ram + (t ? t : 0x2000), 0x40);
+    if (t)
+      SmwCopyToVram(0x6100 + v1 * 0x10, g_ram + t, 0x40);
+    else
+      SmwCopyToVramNoMap(0x6100 + v1 * 0x10, g_ram + 0x2000, 0x40);
     v1 += 2;
   } while (v1 < player_number_of_tiles_to_update);
 }
