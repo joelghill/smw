@@ -555,44 +555,173 @@ Inside the per-sprite function:
 
 ## Step 6 — Per-layer effects (drop shadow)
 
-**Goal:** render each layer into a temp HD buffer, run an effect pass, alpha-blit into the main HD buffer. Implement drop shadow as the first effect.
+**Goal:** render each layer's sprites into a temp HD buffer, run an effect pass (drop shadow for v1), alpha-blit the result onto the main HD buffer. Sets up the per-layer effect-pass pipeline for later additions (outer glow, etc.).
 
-**Read first:** Step 5 output.
+**Status of dependencies:** Step 5 complete. Sprites render directly into the main HD buffer from inside `HdCompositor_DrawSprites`, which owns the `layer = 0..3` outer loop. This step refactors that.
 
-**Tasks:**
+### What Step 5 actually did (read before planning changes)
 
-1. Define layer config in `src/hd_compositor.c`:
+- [src/hd_compositor.c:67](src/hd_compositor.c#L67) `HdCompositor_DrawSprites(hd_buf, hd_pitch, hd_w, hd_h, ppu)` contains the full `for layer in 0..3 { for k = count-1..0 { blit } }` loop and writes straight to the main HD buffer. Step 6 must pull the inner blit out so it can target any buffer and optionally run in silhouette mode.
+- [src/hd_scene.h:14-16](src/hd_scene.h#L14-L16) `HdSprite` stores both `tile_vram` and `tile_num`. The compositor recovers `objAdr = (tile_vram - tile_num*16) & 0x7fff` and walks sub-tiles with the PPU `usedTile` formula. Keep this pattern — the silhouette pass uses exactly the same sub-tile walk.
+- [src/hd_compositor.c:91-163](src/hd_compositor.c#L91-L163) shows the flip handling that must be preserved in silhouette mode: tile-order flip (`src_t_row`/`src_t_col`), within-tile pixel flip (`src_yi`/`src_xi`), AND S×S sub-pixel flip (`src_py`/`src_px` — the commit 7b3b2fe fix for HD detail on flipped sprites).
+- [src/hd_compositor.c:18-20](src/hd_compositor.c#L18-L20) globals: `g_hd_enabled` defaults true; `g_hd_scale` starts 1 and is set by `HdGfx_LoadAll` to the max loaded-sheet scale. Sprite compositing is gated on `g_hd_scale > 1` at [hd_compositor.c:47](src/hd_compositor.c#L47) — so when no HD sheets are present, Step 6 work is a no-op.
+- [src/hd_compositor.c:22-25](src/hd_compositor.c#L22-L25) `HdCompositor_Init` runs at startup **before** SDL/GL have chosen dimensions. HD buffer size (`sd_w * S × sd_h * S`) is only known inside `HdCompositor_Draw`. Allocate HD-sized work buffers lazily on first Draw (or when dims change) — not in Init.
+- An always-on `HdCompositor_DebugDump` at [hd_compositor.c:172](src/hd_compositor.c#L172) fires every 60 frames. Leave it untouched.
+
+### Read first
+
+- [src/hd_compositor.c](src/hd_compositor.c) — whole file, especially `HdCompositor_Draw` and `HdCompositor_DrawSprites`.
+- [src/hd_compositor.h](src/hd_compositor.h) — globals + entry points.
+- [src/hd_scene.h](src/hd_scene.h) — `HdSprite` fields (`tile_vram`, `tile_num`, `layer`, `flags`).
+- [src/hd_gfx.h](src/hd_gfx.h) — `HdSheet` layout (sheets are always 16 tiles wide; `tile_count` varies).
+- [src/hd_vram_map.h](src/hd_vram_map.h) — `HdVramMap_ResolveTile`.
+
+### Tasks
+
+1. **Layer config** — add to `src/hd_compositor.c` (file-static, not exported yet; Step 7 hooks INI to mutate it):
    ```c
    typedef struct HdLayerCfg {
      bool     shadow_enabled;
-     int8     shadow_dx, shadow_dy;   // offset in HD pixels
-     uint8    shadow_alpha;           // 0..255
-     uint32   shadow_bgra;            // fixed shadow color, default 0xff000000 (black, full alpha as source)
+     int16    shadow_dx, shadow_dy;   // offset in HD pixels (may be negative)
+     uint8    shadow_alpha;           // 0..255, the src alpha used when alpha-blitting the shadow buffer
+     uint8    shadow_r, shadow_g, shadow_b;  // shadow color (default black)
    } HdLayerCfg;
 
    static HdLayerCfg g_hd_layer_cfg[4] = {
-     { false }, { false }, { true, 4, 4, 128, 0xff000000 }, { false },
+     [0] = { false },
+     [1] = { false },
+     [2] = { .shadow_enabled = true, .shadow_dx = 4, .shadow_dy = 4,
+             .shadow_alpha = 128, .shadow_r = 0, .shadow_g = 0, .shadow_b = 0 },
+     [3] = { false },
    };
    ```
-2. Change Step 5's compositor to per-layer:
-   - Allocate one persistent `uint8 *g_hd_layer_buffer` of size `HD_W * HD_H * 4`.
-   - For layer in 0..3:
-     - `memset(g_hd_layer_buffer, 0, HD_W * HD_H * 4);`
-     - Composite all `HdSprite`s with `s.layer == layer` into `g_hd_layer_buffer` (same blit as Step 5).
-     - If `g_hd_layer_cfg[layer].shadow_enabled`: **shadow pre-pass** — run *before* the main blit. Two-buffer scheme cleanest: allocate a shadow buffer, draw silhouettes there, alpha-blit it into main HD buffer, *then* alpha-blit the sprite buffer.
-     - Alpha-blit `g_hd_layer_buffer` onto the main HD destination.
-3. Silhouette draw for the shadow pass: same blit logic as Step 5 but output pixel is `shadow_bgra` with `shadow_alpha` scaling A. Offset dest by `(shadow_dx, shadow_dy)`.
-4. Alpha-blit helper: `dst.rgb = src.a*src.rgb + (1 - src.a)*dst.rgb; dst.a = 0xff;`
+   Rationale for layer 2 default: SMW's Mario, enemies, and most gameplay sprites use OAM priority 2. The user can tweak later.
 
-**Gotchas:**
-- Drop shadow for *all sprites in the layer combined* looks different from per-sprite shadows (sprites inside the same layer won't cast shadows on each other). That's the user's stated intent: one shadow per layer group.
-- Shadow extending past the sprite silhouette is correct; don't try to clip to sprite bbox.
-- Memory: 4 layer buffers × 1024×896×4 = 14 MB peak. Reuse one temp buffer — loop over layers sequentially.
-- Ordering: shadow pass should render *before* the sprites of that layer, so sprites in the same layer appear *above* their own shadow.
+2. **Lazy work-buffer management.** Add file-statics:
+   ```c
+   static uint8 *g_hd_layer_buf   = NULL;   // HD-sized, one sprite layer at a time
+   static uint8 *g_hd_shadow_buf  = NULL;   // HD-sized, one shadow silhouette at a time
+   static int    g_hd_buf_width   = 0;
+   static int    g_hd_buf_height  = 0;
+   ```
+   A helper `HdCompositor_EnsureBuffers(int hd_w, int hd_h)` frees + reallocates both buffers when `hd_w`/`hd_h` differ from the cached dims. Call from `HdCompositor_Draw` after computing `hd_width`/`hd_height`, before compositing. Size: `hd_w * hd_h * 4` bytes each. At `S=4`, `1024×896×4 ≈ 3.5 MB × 2 buffers = 7 MB`. Do not free during play; only on `HdCompositor_Shutdown` (add this symbol if it doesn't exist, or free in an `atexit`).
 
-**Acceptance:**
-- With `g_hd_layer_cfg[2].shadow_enabled = true`, Mario has a crisp offset shadow on the ground. Enemies on the same priority also cast shadows (expected). Power-ups too, if they share layer 2.
-- Shadow fades correctly near transparent sprite pixels (alpha respect).
+3. **Refactor the sprite blit.** Rename the Step 5 function and add a mode parameter:
+   ```c
+   typedef enum {
+     kHdBlitColor       = 0,  // CGRAM-indexed color + brightnessMult (Step 5 behavior)
+     kHdBlitSilhouette  = 1,  // fixed RGB from cfg, fixed alpha from cfg, only where HD index != 0
+   } HdBlitMode;
+
+   static void HdCompositor_BlitSprite(uint8 *dst_buf, size_t dst_pitch,
+                                       int dst_w, int dst_h,
+                                       const HdSprite *s,
+                                       HdBlitMode mode,
+                                       int16 offset_x, int16 offset_y,    // in HD pixels
+                                       uint8 sil_r, uint8 sil_g, uint8 sil_b, uint8 sil_a,
+                                       const Ppu *ppu);
+   ```
+   The body is the existing Step 5 inner blit (tile-grid walk, `HdVramMap_ResolveTile`, 8×8 sub-tile pixels, S×S expansion with tri-level flip) lifted verbatim, with two changes:
+   - Add `offset_x` / `offset_y` to the final HD destination coords (in HD pixel units, not SD). `offset_x = offset_y = 0` for color mode; set to `shadow_dx` / `shadow_dy` for silhouette.
+   - The per-pixel color write becomes:
+     ```c
+     if (mode == kHdBlitColor) {
+       uint16 color = cgram[pal_base + index];
+       uint8 r = bmult[(color >>  0) & 0x1f];
+       uint8 g = bmult[(color >>  5) & 0x1f];
+       uint8 b = bmult[(color >> 10) & 0x1f];
+       dst_row[dst_x] = (uint32_t)b | ((uint32_t)g << 8) | ((uint32_t)r << 16) | 0xff000000u;
+     } else {  // kHdBlitSilhouette
+       // Opaque overwrite; multiple silhouettes overlapping within the same buffer must NOT
+       // compound alpha — last-writer-wins is fine because they all share the same color.
+       dst_row[dst_x] = (uint32_t)sil_b | ((uint32_t)sil_g << 8) | ((uint32_t)sil_r << 16)
+                      | ((uint32_t)sil_a << 24);
+     }
+     ```
+   - Everything else (flip tiers, sheet/tile resolve, `tile_in_sheet >= sheet->tile_count` guard, `sheet->scale != S` guard, `index == 0` skip) is shared between modes.
+
+   Silhouette mode still needs the full flip chain so asymmetric sprites produce correctly-shaped silhouettes.
+
+4. **Alpha-blit helper.** Straight CPU loop over `hd_w × hd_h` pixels:
+   ```c
+   static void HdCompositor_AlphaBlit(uint8 *dst, size_t dst_pitch,
+                                      const uint8 *src, size_t src_pitch,
+                                      int w, int h);
+   ```
+   Per pixel, read src BGRA, extract `a = src[3]`; if `a == 0`, skip. Else:
+   ```c
+   uint8 inv = 255 - a;
+   dst[0] = (uint8)((src[0] * a + dst[0] * inv + 127) / 255);  // B
+   dst[1] = (uint8)((src[1] * a + dst[1] * inv + 127) / 255);  // G
+   dst[2] = (uint8)((src[2] * a + dst[2] * inv + 127) / 255);  // R
+   dst[3] = 0xff;  // keep main buffer opaque
+   ```
+   `+127` is round-to-nearest on integer divide by 255.
+
+5. **New per-layer composite in `HdCompositor_Draw`.** Replace the single `HdCompositor_DrawSprites(dst, pitch, hd_w, hd_h, ppu)` call (still guarded by `if (g_hd_scale > 1)`) with:
+   ```c
+   HdCompositor_EnsureBuffers(hd_width, hd_height);
+   size_t work_pitch = (size_t)hd_width * 4;
+
+   for (int layer = 0; layer < 4; layer++) {
+     const HdLayerCfg *cfg = &g_hd_layer_cfg[layer];
+
+     // --- shadow pre-pass (if enabled) -----------------------------------
+     if (cfg->shadow_enabled) {
+       memset(g_hd_shadow_buf, 0, work_pitch * hd_height);
+       // Highest-index-first within layer, matching Step 5's OAM overwrite order.
+       for (int k = (int)g_hd_scene.count - 1; k >= 0; k--) {
+         const HdSprite *s = &g_hd_scene.sprites[k];
+         if (s->layer != layer) continue;
+         HdCompositor_BlitSprite(g_hd_shadow_buf, work_pitch, hd_width, hd_height,
+                                 s, kHdBlitSilhouette,
+                                 cfg->shadow_dx, cfg->shadow_dy,
+                                 cfg->shadow_r, cfg->shadow_g, cfg->shadow_b,
+                                 cfg->shadow_alpha,
+                                 g_my_ppu);
+       }
+       HdCompositor_AlphaBlit(dst, pitch, g_hd_shadow_buf, work_pitch, hd_width, hd_height);
+     }
+
+     // --- sprite layer pass ----------------------------------------------
+     memset(g_hd_layer_buf, 0, work_pitch * hd_height);
+     for (int k = (int)g_hd_scene.count - 1; k >= 0; k--) {
+       const HdSprite *s = &g_hd_scene.sprites[k];
+       if (s->layer != layer) continue;
+       HdCompositor_BlitSprite(g_hd_layer_buf, work_pitch, hd_width, hd_height,
+                               s, kHdBlitColor, 0, 0, 0, 0, 0, 0xff, g_my_ppu);
+     }
+     HdCompositor_AlphaBlit(dst, pitch, g_hd_layer_buf, work_pitch, hd_width, hd_height);
+   }
+   ```
+   Delete the old `HdCompositor_DrawSprites` (it's fully subsumed).
+
+6. **Update the header.** No public API change — the existing `HdCompositor_Draw` signature still works; everything else is file-static. `HdCompositor_GetScene` continues to expose the scene.
+
+7. **Makefile** — no change (new code lives in the existing `hd_compositor.c`).
+
+### Gotchas
+
+- **Silhouette alpha is per-buffer, not per-pixel-accumulated.** Writing `sil_a` directly into the shadow buffer with last-writer-wins means overlapping silhouettes inside the same layer do NOT stack darker — that's intentional. One shadow per layer group. Accumulating per-pixel alpha (using alpha-blit while drawing silhouettes) would darken overlap regions; don't do that.
+- **Flip chain must be complete in silhouette mode.** Mario crouching + facing left (vflip + hflip) must produce a silhouette that actually matches his shape. Reuse the tri-level flip from Step 5 (tile-order + within-tile + S×S sub-pixel) verbatim — strip only the CGRAM lookup.
+- **Shadow pre-pass drops `brightnessMult`.** Silhouettes use raw `shadow_r/g/b`; they don't reflect CGRAM fades. This is deliberate — the shadow is a rendering effect, not game content. Fade-to-black at level end still darkens the sprite layer on top of the (still-black) shadow, producing a reasonable look.
+- **Shadow offset is in HD pixels, not SD.** `shadow_dx = 4` at `S=4` is one SD pixel; at `S=8` it's half an SD pixel. If the user wants "one SD pixel", they'll configure `S` in Step 7.
+- **BG-only alpha in main HD buffer is undefined.** Step 1's nearest-upscale copies whatever alpha was in `g_my_pixels` (likely 0 or 0xff depending on PPU code paths). `AlphaBlit` only reads **src** alpha; it writes `0xff` to dst alpha after blending, so the main buffer becomes uniformly opaque after the first layer's shadow or sprite pass. Fine for the GL upload (ignores alpha anyway).
+- **Buffer sizing edge cases.** When `g_hd_scale == 1`, the sprite composite is gated off and `HdCompositor_EnsureBuffers` never runs — don't call it from the gated `if` or you'll allocate unused memory. Call it inside the `if (g_hd_scale > 1)` block only.
+- **Memory footprint at S=8.** `2048×1792×4 × 2 = 28 MB`. Acceptable.
+- **Scale change after Step 7 toggle.** `HdCompositor_EnsureBuffers` guards on dim-change and reallocates. Don't cache pitch elsewhere.
+- **`offset_x/y` clipping.** Adding `offset_x`, `offset_y` to final HD dst coords can push pixels outside `[0, hd_w) × [0, hd_h)`. The existing per-pixel `if (dst_x < 0 || dst_x >= hd_width) continue;` guard in the Step 5 blit already handles this — keep it.
+- **Sprites whose tiles fall outside the HD map still render nothing in both modes.** `HdVramMap_ResolveTile` failing causes `continue`, so silhouette writes nothing. A sprite with zero mapped sub-tiles casts no shadow. That's correct — there's no HD content to silhouette.
+
+### Acceptance
+
+- **Build clean**, no new warnings.
+- With HD sheets present and `g_hd_layer_cfg[2].shadow_enabled = true` (default): Mario shows an offset drop shadow on layer 2. Enemies drawn on OAM priority 2 also cast shadows. Items/power-ups sharing priority 2 too. Use the Step 5 debug dump to confirm Mario's OAM entries are on layer 2 — if they're on a different layer, document that and point Step 7's default at that layer instead. (Do not hardcode a "Mario layer" — let config decide.)
+- Toggle `g_hd_layer_cfg[2].shadow_enabled = false` at compile time → shadows disappear; sprites render as in Step 5.
+- Flipped sprites cast shape-correct silhouettes: left-facing Mario's shadow points the same direction as his body, not mirrored.
+- No visible alpha compounding when two layer-2 sprites overlap (their shadows merge cleanly, not darken in the overlap region).
+- At `g_hd_scale == 1` (no HD sheets), the compositor is identical to SD — no work buffers allocated, no shadows.
+- Frame rate is unchanged or within noise of Step 5. Per-layer memsets on a 3.5 MB buffer are memory-bandwidth-bound but fast; flag for profiling if a regression appears.
 
 ---
 
