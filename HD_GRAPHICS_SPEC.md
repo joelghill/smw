@@ -925,68 +925,75 @@ Fix as part of Task 3 below. The cleanest predicate is "HD is actually doing som
 
 ### Overview (v2)
 
-**Goal:** display HD replacements for BG1, BG2, and BG3 background tiles, interleaved with HD sprites at the correct PPU priority levels, so that sprites correctly appear in front of or behind background tiles according to their OAM priority and BG tile priority bits.
+**Goal:** display HD replacements for BG1, BG2, and BG3 background tiles, correctly interleaved with HD sprites in PPU priority order, so that BG tiles obscure sprites that the SNES would have placed behind them and vice versa.
 
-**Scope (v2):** BG1 (4bpp FG tileset), BG2 (4bpp BG tileset), BG3 (2bpp UI/text layer), and overworld map tiles. All rendered through the same BG tile compositor once their graphics uploads are tracked.
+**Scope (v2):** BG1 (4bpp FG tileset), BG2 (4bpp BG tileset), BG3 (2bpp UI/text layer), and overworld map tiles. All flow through the same BG tile compositor once their VRAM uploads are tracked.
 
 **Non-goals (v2):**
 - Mode 7 scene replacement (Bowser fight, overworld rotation/zoom). SD upscale + HD sprites only.
-- Color math (add/subtract subscreen) reproduced in HD — HD tiles use CGRAM directly, no subscreen blending.
-- Window clipping on HD BG tiles — HD tiles that are partially window-masked show their full HD area.
+- Color math (add/subtract subscreen) reproduced in HD — HD tiles use CGRAM directly, no subscreen blending. **See "Color-math caveat" below — this is more visible than v1's color-math limitation.**
+- Window clipping on HD BG tiles — HD tiles that are partially window-masked render their full HD area.
 - Subscreen (secondary screen) HD replacement.
 - Lunar Magic BG GFX routing.
+- HD replacement of mosaic-affected layers — falls back to SD for the duration of mosaic.
 
-**Why priority map capture is necessary:**
+### Core architectural principle: gate every HD pass against the SD priority map
 
-v1 upscales the fully composited SD frame (BG + sprites, all layers already merged) and then blits HD sprites on top. For BG tile replacement we must know, for each SD output pixel, *which PPU layer won that pixel*. Without this, an HD BG tile blitted onto the SD upscale would cover SD sprite pixels that should appear in front of it (e.g., an enemy standing in front of a bush would be erased by the HD bush tile). The solution is to capture the PPU's per-pixel priority z-buffer (`bgBuffers[0].data`) immediately after BG+sprite rendering on each scanline, before the CGRAM colour lookup. Then the BG tile compositor uses this buffer to gate each blit: an HD BG tile pixel is only written where the priority map confirms that tile's layer actually won.
+v1 renders sprites only and assumes "HD sprites on top of everything." v2 renders both BG tiles and sprites in HD with arbitrary z-ordering, so it adopts a different correctness model:
 
----
+1. **The SD frame (BG + sprites, fully rendered) is the always-on fallback.** It is nearest-upscaled into the HD buffer at the start of each frame. Anything not painted by an HD pass shows the SD pixel — never invisible, only pixelated.
 
-### Architecture Changes (v2)
+2. **The PPU's per-pixel priority z-buffer (`bgBuffers[0].data`) is captured after each scanline.** This z-buffer reflects which layer (BG1lo/hi, BG2lo/hi, BG3lo/hi, Spr0..3, backdrop) won at each pixel. v2 reads from a CPU-side copy `g_hd_prio_map`.
 
-**New data flow (per frame, HD+BG on):**
+3. **Every HD pass — BG *and sprite* — is gated against the priority map.** A pass for layer L only writes a pixel if `HdDecodeZbuf(g_hd_prio_map[y*256+x]) == L`. The 11-pass execution order is bookkeeping for shadow effects on sprites; correctness comes from the gate, not the order.
+
+   This is the key correctness fix vs. a "render in priority order without gates" approach. Without sprite gating, a sprite at prio 0 standing behind a BG1hi tile would paint its HD pixels on top of the SD upscale; a later BG1hi pass would only cover them where the HD BG sheet is opaque, leaking the sprite through any transparent HD tile pixels. Gating sprites symmetrically with BG tiles eliminates this class of bug regardless of HD sheet alpha shape.
+
+4. **Untracked content (unmapped sprites, animated tiles, mode-7 frames) shows from the SD baseline.** No content is ever missing.
+
+### Architecture changes (data flow per frame, HD+BG on)
 
 1. Game runs, writes OAM/VRAM/CGRAM/tilemap regs as before.
-2. `draw_ppu_frame()` runs `ppu_runLine` for each scanline:
-   - Inside `PpuDrawWholeLine`, after `PpuDrawBackgrounds` has filled `bgBuffers[0]`, **capture** `bgBuffers[0].data[0..255]` into `g_hd_prio_map[(y-1)*256 .. (y-1)*256 + 255]` (new Step 8 hook).
-   - Then the existing CGRAM lookup + pixel-buffer write runs unchanged.
-3. `HdCompositor_Draw` runs:
-   a. Nearest-upscale SD output into HD frame buffer (baseline fallback for all unmapped pixels).
+2. `g_hd_skip_sprites` is **permanently `false` in v2.** Sprites render in SD into `bgBuffers[0]`/`g_my_pixels` so that (a) sprite z-values appear in the priority map and (b) unmapped sprites have SD content as fallback. The v1 sprite-skip mechanism is superseded but left in place for `g_new_ppu == false` (old PPU) fallback.
+3. `RtlDrawPpuFrame` clears `g_hd_prio_map` to zero before `draw_ppu_frame()` runs. A zero entry (z=0x0000) decodes as `kHdBgLayer_Backdrop` and blocks every BG/sprite gate, so any line skipped by forced-blank stays as the upscaled SD pixel (which is also backdrop on those lines).
+4. `draw_ppu_frame()` runs `ppu_runLine` per scanline:
+   - `PpuDrawBackgrounds(ppu, y, false)` renders BG tiles and sprites into `bgBuffers[0]`.
+   - Immediately after, the new capture hook copies `bgBuffers[0].data[0..255]` into `g_hd_prio_map[(y-1)*256 ..]`.
+   - The CGRAM lookup runs unchanged, producing the full SD frame in `g_my_pixels`.
+5. `HdCompositor_Draw` runs:
+   a. Nearest-upscale `g_my_pixels` into the HD buffer.
    b. Build `HdScene` from OAM (unchanged from v1).
-   c. Execute the **full 11-pass priority-ordered composite loop** (new Step 9), replacing the v1 four-pass sprite loop:
-      - BG3 lo, Spr prio 0 (+ shadow), BG3 hi (!bg3prio), Spr prio 1 (+ shadow), BG2 lo, BG1 lo, Spr prio 2 (+ shadow), BG2 hi, BG1 hi, Spr prio 3 (+ shadow), BG3 hi (bg3prio).
-      - Each BG pass calls `HdCompositor_BlitBgLayer`; each sprite pass uses the existing `BlitSprite` mechanism.
+   c. Execute the 11-pass priority-ordered composite loop. **All passes are gated by `g_hd_prio_map`.** Passes write directly into the main HD buffer; sprite passes still use `g_hd_layer_buf` / `g_hd_shadow_buf` for shadow compositing, but the alpha-blit step from work buffer to main buffer applies the priority gate.
 
-**Priority z-buffer encoding (mode 1):**
+### Priority z-buffer encoding
 
-`bgBuffers[0].data[x]` is a `uint16` whose upper byte encodes the priority of the winning layer. The following non-overlapping ranges are stable across all mode-1 frames:
+The PPU stores `dstz[i] = z_base + (palette << palette_shift) + pixel` per pixel. The upper byte of the encoded value identifies the source layer. Pixel and palette bits stay in the lower byte and never carry into the upper byte (max contribution: BG 4bpp `(7<<4) + 15 = 0x7F`; BG 2bpp `(7<<2) + 3 = 0x1F`; sprite contributions stay below 0x10).
 
-| Layer               | Upper-byte range | Notes                                    |
-|---------------------|-----------------|------------------------------------------|
-| Backdrop            | 0x05            | `ClearBackdrop` writes `0x0500`          |
-| BG3 lo              | 0x12            | `zlo=0x1200`, 2bpp, palette+pixel ≤ 0x0A |
-| Sprite prio 0       | 0x24            | `SPRITE_PRIO_TO_PRIO(0,…)=0x24`         |
-| BG3 hi (!bg3prio)   | 0x32            | `zhi=0x3200` when `bgmode & 8 == 0`     |
-| Sprite prio 1       | 0x64            |                                          |
-| BG2 lo              | 0x71–0x77       | `zlo=0x7100`, palette*16 spread         |
-| BG1 lo              | 0x80–0x87       | `zlo=0x8000`                             |
-| Sprite prio 2       | 0xA4            |                                          |
-| BG2 hi              | 0xB1–0xB7       | `zhi=0xB100`                             |
-| BG1 hi              | 0xC0–0xC7       | `zhi=0xC000`                             |
-| Sprite prio 3       | 0xE4            |                                          |
-| BG3 hi (bg3prio)    | 0xF2            | `zhi=0xF200` when `bgmode & 8 != 0`     |
+| Layer               | Upper byte | Source                                    |
+|---------------------|-----------|-------------------------------------------|
+| Backdrop            | 0x00 or 0x05 | Pre-clear (0) / `ClearBackdrop` (0x05) |
+| BG3 lo              | 0x12      | `zlo=0x1200`                              |
+| Sprite prio 0       | 0x24 *or* 0x26 | `SPRITE_PRIO_TO_PRIO(0,level6)`      |
+| BG3 hi (no bg3prio) | 0x32      | `zhi=0x3200` when `bgmode & 8 == 0`       |
+| Sprite prio 1       | 0x64 *or* 0x66 |                                      |
+| BG2 lo              | 0x71      | `zlo=0x7100`                              |
+| BG1 lo              | 0x80      | `zlo=0x8000`                              |
+| Sprite prio 2       | 0xA4 *or* 0xA6 |                                      |
+| BG2 hi              | 0xB1      | `zhi=0xB100`                              |
+| BG1 hi              | 0xC0      | `zhi=0xC000`                              |
+| Sprite prio 3       | 0xE4 *or* 0xE6 |                                      |
+| BG3 hi (bg3prio)    | 0xF2      | `zhi=0xF200` when `bgmode & 8 != 0`       |
 
-No two ranges overlap; a simple cascade of upper-byte threshold checks decodes any z-value to its source layer unambiguously.
+Notes:
+- Sprite upper bytes have a `+2` variant due to the `level6` parameter of `SPRITE_PRIO_TO_PRIO((prio*4+2)*16 + 4 + (level6?2:0))`. The decoder must handle both 0x24 *and* 0x26 (etc.) — use `>=` thresholds, never exact equality.
+- The cascade decoder in `HdDecodeZbuf` works because no two layers' upper-byte ranges overlap. The full mapping for any value is determined entirely by the first matching upper-byte threshold from highest to lowest.
 
-**New symbols (add to `src/hd_compositor.h`):**
+### New symbols (`src/hd_compositor.h`)
 
 ```c
-// Per-frame priority map: 256 * 240 uint16 entries, one per SD pixel.
-// Captured from bgBuffers[0].data each scanline in ppu.c.
-// Allocated in HdCompositor_Init, freed in HdCompositor_Shutdown.
-extern uint16 *g_hd_prio_map;
+extern uint16 *g_hd_prio_map;      // 256 * 240 uint16, alloc in Init / free in Shutdown
+extern bool    g_hd_bg_enabled[3]; // [0]=BG1, [1]=BG2, [2]=BG3 — runtime gate per layer
 
-// Source-layer enum decoded from a priority map entry.
 typedef enum {
   kHdBgLayer_Backdrop      = 0,
   kHdBgLayer_BG3lo         = 1,
@@ -1003,75 +1010,105 @@ typedef enum {
 } HdBgLayerID;
 
 HdBgLayerID HdDecodeZbuf(uint16 z);
-
-// Config flag for BG tile replacement (per-layer).
-// g_hd_bg_enabled[i]: true → replace BG(i+1) tiles with HD; false → SD upscale only.
-extern bool g_hd_bg_enabled[3];  // [0]=BG1, [1]=BG2, [2]=BG3
 ```
+
+### 11-pass composite order (executed by `HdCompositor_Draw`)
+
+| # | Pass                       | Expected layer (gate)        |
+|---|----------------------------|------------------------------|
+| 1 | BG3 lo                     | `kHdBgLayer_BG3lo`           |
+| 2 | Sprite prio 0 (+ shadow)   | `kHdBgLayer_Spr0`            |
+| 3 | BG3 hi (only if !bg3prio)  | `kHdBgLayer_BG3hi_noprio`    |
+| 4 | Sprite prio 1 (+ shadow)   | `kHdBgLayer_Spr1`            |
+| 5 | BG2 lo                     | `kHdBgLayer_BG2lo`           |
+| 6 | BG1 lo                     | `kHdBgLayer_BG1lo`           |
+| 7 | Sprite prio 2 (+ shadow)   | `kHdBgLayer_Spr2`            |
+| 8 | BG2 hi                     | `kHdBgLayer_BG2hi`           |
+| 9 | BG1 hi                     | `kHdBgLayer_BG1hi`           |
+|10 | Sprite prio 3 (+ shadow)   | `kHdBgLayer_Spr3`            |
+|11 | BG3 hi (only if  bg3prio)  | `kHdBgLayer_BG3hi_prio`      |
+
+The order is for shadow-stacking determinism only. Every pass gates on its expected layer; a pixel is overwritten iff `HdDecodeZbuf(g_hd_prio_map[y*256+x]) == expected`.
+
+---
+
+### Color-math caveat (read before Step 9)
+
+SMW uses subscreen color math for several visible effects:
+- Underwater color overlay (Vanilla Dome, Yoshi's Island 2, etc.)
+- Smoke / cloud sprites with half-color blending
+- Fade-to-black/white transitions on level entry, death, P-switch
+
+HD BG tiles in v2 sample CGRAM directly and skip color math. Where SD tiles around the HD area are color-blended, HD tiles will look "pure" — visibly different from their surroundings. This is more noticeable than the v1 sprite-only color-math limitation because BG tiles cover much larger screen areas. **Document this prominently in user-facing notes; do not present v2 as "looks like SD but crisper."**
 
 ---
 
 ### Step 8 — Per-scanline priority map capture
 
-**Goal:** After each scanline is rendered, copy the PPU's raw priority z-buffer (`bgBuffers[0].data`) into a CPU-side frame buffer `g_hd_prio_map`. Provide `HdDecodeZbuf` to classify any z-value to its source layer.
+**Goal:** allocate `g_hd_prio_map`, capture `bgBuffers[0].data` after each scanline's `PpuDrawBackgrounds`, expose `HdDecodeZbuf`. No visible behavior change yet — sprites still render in SD, no HD BG path exists.
 
 **Read first:**
-- [src/snes/ppu.c: `PpuDrawWholeLine`](src/snes/ppu.c) — understand the call sequence: `ClearBackdrop` → `PpuDrawBackgrounds` → optional subscreen → final CGRAM loop.
-- [src/snes/ppu.h: `PpuPixelPrioBufs`](src/snes/ppu.h) — `bgBuffers[0].data` is `uint16_t[kPpuXPixels]` = `uint16[256]`. `kPpuExtraLeftRight == 0` so `data[0..255]` maps directly to screen pixels 0..255.
-- Step 7 outputs — `HdCompositor_Init`, `HdCompositor_Shutdown`, and the `g_hd_enabled` guard.
+- [src/snes/ppu.c: `PpuDrawWholeLine`](src/snes/ppu.c#L659) — sequence: `ClearBackdrop` → `PpuDrawBackgrounds(ppu, y, false)` → optional subscreen → CGRAM lookup loop.
+- [src/snes/ppu.h: `PpuPixelPrioBufs`, `kPpuExtraLeftRight`](src/snes/ppu.h) — confirm `bgBuffers[0].data` is `uint16[256 + 2*kPpuExtraLeftRight]`. With `kPpuExtraLeftRight == 0`, indices `0..255` map directly to screen pixels.
+- Step 7 outputs in [src/hd_compositor.c](src/hd_compositor.c) — `HdCompositor_Init`, `HdCompositor_Shutdown`, `g_hd_enabled`.
 
 **Tasks:**
 
-1. **Allocate `g_hd_prio_map`.** In `hd_compositor.c`, add:
+1. **Allocate `g_hd_prio_map`.** In `hd_compositor.c`:
    ```c
    uint16 *g_hd_prio_map = NULL;
-   bool    g_hd_bg_enabled[3] = { true, true, false };  // BG3 off until Step 10
+   bool    g_hd_bg_enabled[3] = { false, false, false };  // off until Step 9b/10
    ```
-   In `HdCompositor_Init`, after existing init work:
+   In `HdCompositor_Init`:
    ```c
    if (!g_hd_prio_map)
      g_hd_prio_map = (uint16 *)malloc(256 * 240 * sizeof(uint16));
    ```
-   In `HdCompositor_Shutdown`:
-   ```c
-   free(g_hd_prio_map); g_hd_prio_map = NULL;
-   ```
-   Declare extern in `src/hd_compositor.h`.
+   In `HdCompositor_Shutdown`: `free(g_hd_prio_map); g_hd_prio_map = NULL;`
+   Declare `extern` in `hd_compositor.h`.
 
-2. **Capture hook in `ppu.c`.** In `PpuDrawWholeLine` ([src/snes/ppu.c](src/snes/ppu.c)), immediately after the `PpuDrawBackgrounds(ppu, y, false)` call and *before* the subscreen / CGRAM composite block, insert:
+2. **Capture hook in `ppu.c`.** Inside `PpuDrawWholeLine`, immediately after `PpuDrawBackgrounds(ppu, y, false)` and before any subscreen / CGRAM code:
    ```c
-   // Capture per-pixel priority for HD BG compositor.
+   // HD compositor: capture per-pixel priority. extern decls used to avoid
+   // pulling hd_compositor.h into ppu.c (ppu.c has no SMW deps by design).
    extern uint16 *g_hd_prio_map;
    extern bool    g_hd_enabled;
    if (g_hd_enabled && g_hd_prio_map) {
-     int sy = (int)y - 1;  // y is 1-based; sy is 0-based
+     int sy = (int)y - 1;  // y is 1-based
      if ((unsigned)sy < 240)
-       memcpy(g_hd_prio_map + sy * 256, ppu->bgBuffers[0].data, 256 * sizeof(uint16));
+       memcpy(g_hd_prio_map + (size_t)sy * 256, ppu->bgBuffers[0].data, 256 * sizeof(uint16));
    }
    ```
-   Do **not** add an `#include`; use `extern` declarations directly (ppu.c is a C translation unit that already has direct `extern bool g_hd_skip_sprites` as a precedent from Step 1).
+   Forced-blank lines return early before this point — they leave the prior frame's pre-clear (Task 4) untouched.
 
-3. **Implement `HdDecodeZbuf`.** Add to `hd_compositor.c` and declare in `hd_compositor.h`:
+3. **Implement `HdDecodeZbuf`.** Cascade decoder using `>=` thresholds:
    ```c
    HdBgLayerID HdDecodeZbuf(uint16 z) {
      uint8 hi = (uint8)(z >> 8);
      if (hi >= 0xF2) return kHdBgLayer_BG3hi_prio;
-     if (hi >= 0xE4) return kHdBgLayer_Spr3;
+     if (hi >= 0xE4) return kHdBgLayer_Spr3;       // 0xE4 or 0xE6 (level6 bit)
      if (hi >= 0xC0) return kHdBgLayer_BG1hi;
      if (hi >= 0xB1) return kHdBgLayer_BG2hi;
-     if (hi >= 0xA4) return kHdBgLayer_Spr2;
+     if (hi >= 0xA4) return kHdBgLayer_Spr2;       // 0xA4 or 0xA6
      if (hi >= 0x80) return kHdBgLayer_BG1lo;
      if (hi >= 0x71) return kHdBgLayer_BG2lo;
-     if (hi >= 0x64) return kHdBgLayer_Spr1;
+     if (hi >= 0x64) return kHdBgLayer_Spr1;       // 0x64 or 0x66
      if (hi >= 0x32) return kHdBgLayer_BG3hi_noprio;
-     if (hi >= 0x24) return kHdBgLayer_Spr0;
+     if (hi >= 0x24) return kHdBgLayer_Spr0;       // 0x24 or 0x26
      if (hi >= 0x12) return kHdBgLayer_BG3lo;
-     return kHdBgLayer_Backdrop;
+     return kHdBgLayer_Backdrop;                    // covers 0x00 (pre-clear) and 0x05 (ClearBackdrop)
    }
    ```
-   The thresholds derive from the encoding table in the Architecture section above. Values in the gap ranges (e.g. 0x25..0x31) do not occur in practice.
+   Use `>=` (not equality). The level6 bit produces 0x_6 variants for sprite priorities; the cascade subsumes them.
 
-4. **Extend the always-on debug dump.** In `HdCompositor_DebugDump` (runs ~1 Hz), add a single line printing the decoded layer for a fixed SD pixel (e.g. `(128, 112)`) to validate capture:
+4. **Pre-clear `g_hd_prio_map` per frame.** In `RtlDrawPpuFrame` ([src/main.c:183](src/main.c#L183)), inside the `if (hd_active)` block, before `g_rtl_game_info->draw_ppu_frame()`:
+   ```c
+   if (g_hd_prio_map)
+     memset(g_hd_prio_map, 0, 256 * 240 * sizeof(uint16));
+   ```
+   Zero ⇒ `kHdBgLayer_Backdrop` ⇒ no gate ever passes ⇒ uncaptured lines stay as the SD upscale (which is also backdrop on those lines).
+
+5. **Debug hook.** In `HdCompositor_DebugDump` (~1 Hz), add:
    ```c
    if (g_hd_prio_map) {
      uint16 z = g_hd_prio_map[112 * 256 + 128];
@@ -1079,357 +1116,387 @@ extern bool g_hd_bg_enabled[3];  // [0]=BG1, [1]=BG2, [2]=BG3
    }
    ```
 
+6. **Do not yet flip `g_hd_skip_sprites`.** Leave the v1 sprite-skip behavior as-is for this step. The flip happens in Step 9a together with the pass-loop refactor, so any regression bisects cleanly.
+
 **Gotchas:**
-- **Forced-blank lines.** When `PPU_forcedBlank(ppu)`, `PpuDrawWholeLine` returns early before reaching the capture point — `bgBuffers[0]` is never filled for that line. Guard `if (!PPU_forcedBlank(ppu))` before the capture, or accept that those rows stay at their previous value (harmless — the compositor skips forced-blank pixels anyway).
-- **Overscan.** If the game uses 240-line mode (`ppu->frameOverscan`), lines 225–240 are valid and `g_hd_prio_map` must be 240 lines deep. The 240-line allocation already covers this.
-- **`kPpuExtraLeftRight == 0`.** The `bgBuffers[0].data` array starts at index 0 for screen pixel 0 with no extra margin. If this constant ever changes, the `memcpy` offset must be updated.
-- **Subscreen.** `PpuDrawBackgrounds(ppu, y, true)` (subscreen) also writes `bgBuffers[1]`, which we do not capture. HD compositing ignores the subscreen; v2 limitation noted below.
-- **`g_new_ppu == false`.** When the old PPU renderer is active (`PpuDrawWholeLineOldPpu`), `bgBuffers[0]` is not used. The old PPU path does not produce useful priority data. Guard: if `!g_new_ppu` set `g_hd_bg_enabled[0..2] = false` (fall back to SD upscale + HD sprites only). Check `g_new_ppu` in `HdCompositor_Init`; print a warning if old PPU and BG HD is enabled.
+- `kPpuExtraLeftRight` — currently 0. If it ever becomes nonzero, the capture base must shift by `kPpuExtraLeftRight`.
+- `g_new_ppu == false` (old PPU): `bgBuffers[0]` is unused. The capture hook is a no-op (data stays as zero). Step 9b/10 must additionally guard BG enable on `g_new_ppu == true`.
+- Subscreen pass writes `bgBuffers[1]` — ignored.
+- 240-line overscan: `frameOverscan` lines fit because the buffer is allocated at 240 lines.
 
 **Acceptance:**
-- Build clean.
-- Run Yoshi's Island 1. The debug dump shows `prio_map[112,128]` decoding to `kHdBgLayer_BG1lo` or `kHdBgLayer_BG2lo` (a background tile), or a sprite layer if Mario is centred at screen-centre. Manually verify against what is visually at that pixel.
-- Enter a forced-blank frame (save/load state): no crash. Capture guard prevents writing garbage.
+- Build clean, no warnings.
+- Run Yoshi's Island 1; `prio_map[112,128]` decodes to a plausible layer (BG1lo / BG2lo / Spr2 if Mario is centered).
+- Save/load (forced-blank during transition) does not crash.
+- v1 sprite rendering visually unchanged.
 
 ---
 
-### Step 9 — HD BG1/BG2 tile compositor
+### Step 9a — Refactor `HdCompositor_Draw` into the 11-pass loop (BG passes are no-ops)
 
-**Goal:** Walk BG1 (PPU layer 0) and BG2 (PPU layer 1) tilemaps from VRAM each frame; for each visible 8×8 tile that resolves to a loaded HD sheet, blit it at the correct HD-scale screen position, gated by the priority map so tiles only overwrite the SD upscale where they actually won the priority battle. Refactor `HdCompositor_Draw` to execute all 11 passes in the correct PPU priority order.
+**Goal:** replace the v1 four-iteration sprite loop with the full 11-pass scaffolding. BG slots are explicit no-op stubs; sprite slots match v1 behavior 1:1. Flip `g_hd_skip_sprites = false` so SD sprites become the always-on baseline. The user-visible result of this step **must be visually identical to post-Step-7 v1.**
 
 **Read first:**
-- [src/snes/ppu.c: `PpuDrawBackground_4bpp`](src/snes/ppu.c) — the reference for tilemap addressing (scroll, `PPU_bgTilemapAdr`, tilemap entry decoding, `PPU_bgTileAdr`, tile VRAM address formula). Mirror its tile-walk logic exactly.
-- [src/snes/ppu.h: `PPU_bgTileAdr`, `PPU_bgTilemapAdr`, `PPU_bgTilemapWider`, `PPU_bgTilemapHigher`, `PPU_bg3priority`, `PPU_mode`](src/snes/ppu.h) — macros used in the tile walk.
-- [src/hd_vram_map.h](src/hd_vram_map.h) — `HdVramMap_ResolveTile(vram_word_addr, &sheet_id, &tile_in_sheet)`. Same function used for both sprites and BG tiles; the 4bpp 16-word/tile stride applies identically.
-- Step 8 output — `g_hd_prio_map`, `HdDecodeZbuf`, `HdBgLayerID`.
-- Step 6 output — `HdCompositor_BlitSprite`, `HdCompositor_AlphaBlit`, `g_hd_layer_buf`, `g_hd_shadow_buf`, `HdLayerCfg`.
-
-**Key facts:**
-
-- **Tilemap entry format (16-bit word):**
-  - Bits 9–0: tile number (0..1023), index into graphics tileset.
-  - Bits 12–10: palette (0..7); BG1/BG2 CGRAM base = `palette * 16` (not `0x80 + palette*16` like sprites).
-  - Bit 13: tile priority (0 = lo, 1 = hi).
-  - Bit 14: hflip (if set, tile is horizontally flipped).
-  - Bit 15: vflip.
-- **VRAM tile word-address for 4bpp BG:** `(PPU_bgTileAdr(ppu, layer) + tile_num * 16) & 0x7fff`. Identical formula to `objAdr + usedTile * 16` for sprites.
-- **Tilemap addressing with scroll:** `PPU_bgTilemapAdr(ppu, layer)` gives the base. Scrolled tilemap row = `((screen_y + vScroll[layer]) >> 3) & 0x1f`; scrolled col = `((screen_x + hScroll[layer]) >> 3) & 0x1f`. For wide (64-pixel) or tall (64-tile) tilemaps, an additional `0x400`-word offset selects the second horizontal page, and `0x400` (narrow) or `0x800` (wide) selects the second vertical page — mirror `PpuDrawBackground_4bpp` exactly.
-- **SD pixel → screen tile position:** the SD pixel at `(sd_x, sd_y)` falls in tile column `((sd_x + hScroll) >> 3) & 0x1f` and tile row `((sd_y + vScroll) >> 3) & 0x1f` of the tilemap. Within the tile: `x_in_tile = (sd_x + hScroll) & 7`, `y_in_tile = (sd_y + vScroll) & 7`.
-- **Tri-level flip in the HD blit** (identical to sprites): tile-order flip (through `src_xi`/`src_yi`), within-tile pixel flip (through `src_xi * S + src_px`), and sub-pixel flip (S×S block flip via `src_px`, `src_py`). All three tiers must be applied or flipped tiles render incorrectly.
+- Current `HdCompositor_Draw` at [src/hd_compositor.c:115](src/hd_compositor.c#L115) — the four-layer loop with shadow then color blits via `g_hd_layer_buf` / `g_hd_shadow_buf` / `HdCompositor_AlphaBlit`.
+- `RtlDrawPpuFrame` setting `g_hd_skip_sprites = hd_active` in [src/main.c:183](src/main.c#L183).
+- Step 8 outputs.
 
 **Tasks:**
 
-1. **New `HdCompositor_BlitBgLayer` function.** Add to `hd_compositor.c` (file-static):
+1. **Extract `HdCompositor_CompositeSpriteLayer`.** New file-static helper:
+   ```c
+   static void HdCompositor_CompositeSpriteLayer(
+       uint8 *dst, size_t pitch, int hd_w, int hd_h,
+       int oam_prio, const Ppu *ppu);
+   ```
+   Body is the existing per-layer block from `HdCompositor_Draw`: shadow pre-pass into `g_hd_shadow_buf`, alpha-blit; color pass into `g_hd_layer_buf`, alpha-blit. Filter on `s->layer == oam_prio` exactly as v1 does. **Do not yet add the priority gate** — Step 9b adds it once a real BG layer exists to test the gate against.
+
+2. **Add `HdCompositor_BlitBgLayer` stub.** New file-static helper:
    ```c
    static void HdCompositor_BlitBgLayer(
-       uint8     *hd_buf,         // destination HD frame buffer
-       size_t     hd_pitch,
-       int        hd_w, int hd_h,
-       int        bg_layer,       // 0 = BG1, 1 = BG2
-       bool       prio_hi,        // true = only render high-priority tiles
-       HdBgLayerID expected_layer, // kHdBgLayer_BG1hi, kHdBgLayer_BG2lo, etc.
-       const Ppu *ppu);
+       uint8 *dst, size_t pitch, int hd_w, int hd_h,
+       int bg_layer,                  // 0=BG1, 1=BG2, 2=BG3
+       bool prio_hi,
+       HdBgLayerID expected_layer,
+       const Ppu *ppu) {
+     (void)dst; (void)pitch; (void)hd_w; (void)hd_h;
+     (void)bg_layer; (void)prio_hi; (void)expected_layer; (void)ppu;
+     // Implemented in Step 9b (BG1/BG2 4bpp) and Step 10 (BG3 2bpp).
+   }
    ```
-   Algorithm:
-   - Early exit if `!g_hd_bg_enabled[bg_layer]` or `PPU_mode(ppu) != 1`.
-   - Compute `S = g_hd_scale`, `sd_w = hd_w / S`, `sd_h = hd_h / S`.
-   - Read `tileadr = PPU_bgTileAdr(ppu, bg_layer)`, `tilemap_base = PPU_bgTilemapAdr(ppu, bg_layer)`.
-   - Read `hs = (int)ppu->hScroll[bg_layer]`, `vs = (int)ppu->vScroll[bg_layer]`.
-   - Iterate tile rows and columns covering the visible screen (32 cols × 29 rows maximum to handle partial tiles at edges):
-     ```c
-     // First tile partially visible at top-left:
-     // Its top-left SD pixel is at screen position (pix_x_start, pix_y_start).
-     int pix_x_start = -(hs & 7);
-     int pix_y_start = -(vs & 7);
-     for (int tr = 0; tr <= (sd_h + (vs & 7) + 7) / 8; tr++) {
-       int screen_tile_y = pix_y_start + tr * 8;  // SD y of tile top row
-       if (screen_tile_y >= sd_h) break;
-       uint scrolled_y = (uint)(vs + tr * 8 - (vs & 7));
-       int tilemap_row = (scrolled_y >> 3) & 0x1f;
-       bool use_y_hi = (scrolled_y & 0x100) && PPU_bgTilemapHigher(ppu, bg_layer);
 
-       for (int tc = 0; tc <= (sd_w + (hs & 7) + 7) / 8; tc++) {
-         int screen_tile_x = pix_x_start + tc * 8;
-         if (screen_tile_x >= sd_w) break;
-         uint scrolled_x = (uint)(hs + tc * 8 - (hs & 7));
-         int tilemap_col = (scrolled_x >> 3) & 0x1f;
-         bool use_x_hi = (scrolled_x & 0x100) && PPU_bgTilemapWider(ppu, bg_layer);
+3. **Rewrite `HdCompositor_Draw` body** (after the upscale + `HdScene_Build`):
+   ```c
+   if (g_hd_scale > 1 && PPU_mode(g_my_ppu) == 1) {
+     bool bg3prio = PPU_bg3priority(g_my_ppu) != 0;
 
-         // Build tilemap word-address (matches PpuDrawBackground_4bpp's sc_offs logic):
-         int sc_offs = (int)tilemap_base;
-         if (use_y_hi) sc_offs += PPU_bgTilemapWider(ppu, bg_layer) ? 0x800 : 0x400;
-         if (use_x_hi) sc_offs += 0x400;
-         uint16 te = ppu->vram[(sc_offs + tilemap_row * 32 + tilemap_col) & 0x7fff];
+     HdCompositor_BlitBgLayer(dst, pitch, hd_w, hd_h, 2, false, kHdBgLayer_BG3lo,        g_my_ppu);
+     HdCompositor_CompositeSpriteLayer(dst, pitch, hd_w, hd_h, 0, g_my_ppu);
+     if (!bg3prio)
+       HdCompositor_BlitBgLayer(dst, pitch, hd_w, hd_h, 2, true,  kHdBgLayer_BG3hi_noprio, g_my_ppu);
+     HdCompositor_CompositeSpriteLayer(dst, pitch, hd_w, hd_h, 1, g_my_ppu);
+     HdCompositor_BlitBgLayer(dst, pitch, hd_w, hd_h, 1, false, kHdBgLayer_BG2lo,        g_my_ppu);
+     HdCompositor_BlitBgLayer(dst, pitch, hd_w, hd_h, 0, false, kHdBgLayer_BG1lo,        g_my_ppu);
+     HdCompositor_CompositeSpriteLayer(dst, pitch, hd_w, hd_h, 2, g_my_ppu);
+     HdCompositor_BlitBgLayer(dst, pitch, hd_w, hd_h, 1, true,  kHdBgLayer_BG2hi,        g_my_ppu);
+     HdCompositor_BlitBgLayer(dst, pitch, hd_w, hd_h, 0, true,  kHdBgLayer_BG1hi,        g_my_ppu);
+     HdCompositor_CompositeSpriteLayer(dst, pitch, hd_w, hd_h, 3, g_my_ppu);
+     if (bg3prio)
+       HdCompositor_BlitBgLayer(dst, pitch, hd_w, hd_h, 2, true,  kHdBgLayer_BG3hi_prio,  g_my_ppu);
+   } else {
+     // Mode 7 (or HD off): keep v1 sprite-on-top behavior — sprites render in SD,
+     // and no HD passes execute (BG stubs no-op, sprite passes execute and look correct
+     // because there's nothing for them to incorrectly cover).
+     for (int p = 0; p < 4; p++)
+       HdCompositor_CompositeSpriteLayer(dst, pitch, hd_w, hd_h, p, g_my_ppu);
+   }
+   ```
+   Note: `g_my_ppu` is the symbol used elsewhere in [src/hd_compositor.c](src/hd_compositor.c) (e.g. line 129); confirm it resolves before relying on it.
 
-         int tile_num  = te & 0x3ff;
-         bool tile_hi  = (te >> 13) & 1;
-         int  palette  = (te >> 10) & 7;
-         bool hflip    = (te >> 14) & 1;
-         bool vflip    = (te >> 15) & 1;
+4. **Flip `g_hd_skip_sprites = false`.** In [src/main.c:183](src/main.c#L183) `RtlDrawPpuFrame`:
+   ```c
+   g_hd_skip_sprites = false;  // v2: sprites always render in SD as baseline
+   ```
+   Sprites now appear in `g_my_pixels` (the SD frame) AND in `bgBuffers[0]` (the priority map). The HD sprite passes overwrite the SD sprite pixels with HD versions. Because `HdCompositor_BlitSprite` writes opaque HD sprite pixels (not alpha-blended on top of SD), the visual result for tracked sprites is identical to v1; for untracked sprites the SD version now shows through where v1 had blank.
 
-         if ((bool)tile_hi != prio_hi) continue;  // skip wrong priority tier
+   **Visual diff vs. v1:** previously, a sprite without an HD replacement was invisible. Now it renders as nearest-upscaled SD. This is the only intended visible delta of Step 9a. If the user wants strict v1 parity for unmapped sprites, leave Step 9a's flip out and have Step 9b enable it together with BG rendering.
 
-         uint16 tile_vram = (uint16)((tileadr + tile_num * 16) & 0x7fff);
-         uint8  sheet_id;
-         uint16 tile_in_sheet;
-         if (!HdVramMap_ResolveTile(tile_vram, &sheet_id, &tile_in_sheet)) continue;
-         const HdSheet *sheet = &g_hd_sheets[sheet_id];
-         if (!sheet->loaded || sheet->scale != (uint8)S) continue;
-         if (tile_in_sheet >= sheet->tile_count) continue;
+**Gotchas:**
+- `g_new_ppu == false` (old PPU): the priority map will be all zeros and BG passes (when implemented in 9b) will all gate-fail correctly. Sprite passes still work.
+- The mode-7 fallback path duplicates v1 exactly. Test by entering the Bowser fight or the world map rotation.
 
-         int tx = (tile_in_sheet & 0xf) * 8 * S;  // HD x of tile top-left in sheet
-         int ty = (tile_in_sheet >> 4)  * 8 * S;  // HD y of tile top-left in sheet
-         int pal_base = palette * 16;              // BG CGRAM base (no 0x80 offset)
-         const uint8  *idx_buf = sheet->index_buffer;
-         int sh_width = (int)sheet->width;
+**Acceptance:**
+- Build clean.
+- Yoshi's Island 1: visually identical to post-Step-7. Frame-by-frame comparison.
+- Mode 7 (Bowser fight, OW rotation): visually identical to post-Step-7.
+- A level with an enemy whose HD sheet is *not* loaded: enemy now appears as upscaled SD instead of vanishing (this is the intended delta).
+- `HdCompositor_DebugDump` continues printing prio map sample.
 
-         // Blit the 8×8 SD-pixel tile (expanding each SD pixel to S×S HD pixels):
-         for (int yi = 0; yi < 8; yi++) {
-           int src_yi  = vflip ? (7 - yi) : yi;
-           int sd_y    = screen_tile_y + yi;
-           if (sd_y < 0 || sd_y >= sd_h) continue;
+---
 
-           for (int xi = 0; xi < 8; xi++) {
-             int src_xi  = hflip ? (7 - xi) : xi;
-             int sd_x    = screen_tile_x + xi;
-             if (sd_x < 0 || sd_x >= sd_w) continue;
+### Step 9b — BG1/BG2 4bpp tile compositor + sprite priority gate
 
-             // Priority gate: only blit where this layer won in the SD frame.
-             uint16 z = g_hd_prio_map[sd_y * 256 + sd_x];
-             if (HdDecodeZbuf(z) != expected_layer) continue;
+**Goal:** Implement `HdCompositor_BlitBgLayer` for 4bpp BG1/BG2. Add the priority gate to sprite passes too. After this step, BG1/BG2 tiles render in HD where sheets are loaded; HD sprites only paint where SD sprites won at that pixel; transparent HD pixels safely fall through to SD baseline regardless of layer order.
 
-             int out_x_base = sd_x * S;
-             int out_y_base = sd_y * S;
-             int hd_sx = tx + src_xi * S;
-             int hd_sy = ty + src_yi * S;
+**Read first:**
+- [src/snes/ppu.c: `PpuDrawBackground_4bpp`](src/snes/ppu.c#L203) — the canonical tilemap-walk algorithm. **Mirror its structure exactly.** The v1 sprite tri-flip bug came from inventing geometry from scratch instead of mirroring `ppu_evaluateSprites`; do not repeat that mistake here.
+- `PPU_bgTileAdr`, `PPU_bgTilemapAdr`, `PPU_bgTilemapWider`, `PPU_bgTilemapHigher`, `PPU_mode`, `PPU_bg3priority`, `PPU_mosaicSize`, `PPU_mosaicEnabled` macros in [src/snes/ppu.h](src/snes/ppu.h).
+- [src/hd_vram_map.h](src/hd_vram_map.h) — `HdVramMap_ResolveTile`. The 4bpp 16-words/tile stride is fine for BG1/BG2. (BG3 needs the stride parameter added in Step 10.)
+- [src/hd_compositor.c](src/hd_compositor.c) — `HdCompositor_AlphaBlit` (line 183), `HdCompositor_BlitSprite` (line 208), `HdLayerCfg`.
 
-             for (int py = 0; py < S; py++) {
-               int src_py = vflip ? (S - 1 - py) : py;
-               int dst_y  = out_y_base + py;
-               if (dst_y < 0 || dst_y >= hd_h) continue;
-               uint32_t *dst_row = (uint32_t *)(hd_buf + (size_t)dst_y * hd_pitch);
-               for (int px = 0; px < S; px++) {
-                 int src_px = hflip ? (S - 1 - px) : px;
-                 int dst_x  = out_x_base + px;
-                 if (dst_x < 0 || dst_x >= hd_w) continue;
-                 uint8 index = idx_buf[(hd_sy + src_py) * sh_width + hd_sx + src_px];
-                 if (index == 0) continue;   // transparent in HD sheet
-                 uint16 color = ppu->cgram[pal_base + index];
-                 uint8 r = ppu->brightnessMult[(color >>  0) & 0x1f];
-                 uint8 g = ppu->brightnessMult[(color >>  5) & 0x1f];
-                 uint8 b = ppu->brightnessMult[(color >> 10) & 0x1f];
-                 dst_row[dst_x] = (uint32_t)b | ((uint32_t)g << 8) |
-                                  ((uint32_t)r << 16) | 0xff000000u;
-               }
-             }
-           }
+**Key tilemap facts:**
+
+- **Tilemap entry (16-bit word):** bits 0–9 tile_num; bits 10–12 palette; bit 13 prio (0=lo, 1=hi); bit 14 hflip; bit 15 vflip.
+- **Tile VRAM word-address (4bpp):** `(PPU_bgTileAdr(ppu, layer) + tile_num * 16) & 0x7fff`.
+- **CGRAM base for BG1/BG2 4bpp:** `palette * 16` (not `0x80 + palette*16` — that 0x80 offset is sprite-only).
+- **Tilemap addressing with scroll:** mirror lines 217–235 of `PpuDrawBackground_4bpp`. Scrolled `y = screen_y + ppu->vScroll[layer]`; `sc_offs = PPU_bgTilemapAdr + ((y >> 3) & 0x1f) << 5)`; `(y & 0x100) && PPU_bgTilemapHigher` selects the second vertical page; `tps[2]` array gives the two horizontal pages and `(x >> 8) & 1` selects between them.
+- **Tri-level flip in the HD blit** (identical to sprites): tile-order flip via `src_xi/src_yi`, within-tile pixel flip via `xi/yi → src_xi/src_yi`, sub-pixel flip via `S×S` block. **All three must be applied.**
+
+**Tasks:**
+
+1. **Implement `HdCompositor_BlitBgLayer` for 4bpp.** Recommended structure: iterate scanline-style, mirroring `PpuDrawBackground_4bpp`'s outer loop.
+
+   Pseudo-code (column-major iteration is fine too; this is the version closest to the PPU reference):
+   ```c
+   if (!g_hd_bg_enabled[bg_layer]) return;
+   if (PPU_mode(ppu) != 1) return;
+   if (!g_new_ppu) return;
+   if (PPU_mosaicSize(ppu) > 1 && PPU_mosaicEnabled(ppu, bg_layer)) return;  // see gotcha
+
+   int S      = g_hd_scale;
+   int sd_h   = hd_h / S;
+   int sd_w   = hd_w / S;
+   int tileadr = PPU_bgTileAdr(ppu, bg_layer);
+   uint8 *idx_buf;  // resolved per-tile
+
+   for (int sy = 0; sy < sd_h; sy++) {
+     // Per-row scrolled tilemap pointers (mirror lines 216-223 of PpuDrawBackground_4bpp).
+     uint y_scrolled = (uint)(sy + ppu->vScroll[bg_layer]);
+     int sc_offs = PPU_bgTilemapAdr(ppu, bg_layer) + (((y_scrolled >> 3) & 0x1f) << 5);
+     if ((y_scrolled & 0x100) && PPU_bgTilemapHigher(ppu, bg_layer))
+       sc_offs += PPU_bgTilemapWider(ppu, bg_layer) ? 0x800 : 0x400;
+     const uint16 *tps[2] = {
+       &ppu->vram[sc_offs & 0x7fff],
+       &ppu->vram[(sc_offs + (PPU_bgTilemapWider(ppu, bg_layer) ? 0x400 : 0)) & 0x7fff],
+     };
+     int y_in_tile = y_scrolled & 7;
+
+     // For each SD pixel in the row.
+     uint x_scrolled = (uint)ppu->hScroll[bg_layer];
+     for (int sx = 0; sx < sd_w; sx++, x_scrolled++) {
+       // Priority gate.
+       if (HdDecodeZbuf(g_hd_prio_map[sy * 256 + sx]) != expected_layer) continue;
+
+       const uint16 *tp = tps[(x_scrolled >> 8) & 1];
+       uint16 te = tp[(x_scrolled >> 3) & 0x1f];
+
+       if (((te >> 13) & 1) != (uint)prio_hi) continue;
+
+       int  tile_num = te & 0x3ff;
+       int  palette  = (te >> 10) & 7;
+       bool hflip    = (te >> 14) & 1;
+       bool vflip    = (te >> 15) & 1;
+
+       uint16 tile_vram = (uint16)((tileadr + tile_num * 16) & 0x7fff);
+       uint8  sheet_id;
+       uint16 tile_in_sheet;
+       if (!HdVramMap_ResolveTile(tile_vram, &sheet_id, &tile_in_sheet)) continue;
+       const HdSheet *sheet = &g_hd_sheets[sheet_id];
+       if (!sheet->loaded || sheet->scale != (uint8)S) continue;
+       if (tile_in_sheet >= sheet->tile_count) continue;
+
+       // Source 8x8 SD pixel within the tile, with within-tile flip.
+       int x_in_tile_sd = vflip ? (7 - (int)(x_scrolled & 7)) : (int)(x_scrolled & 7);
+       int y_in_tile_sd = vflip ? (7 - y_in_tile)             : y_in_tile;
+       // Actually: hflip flips x, vflip flips y. Recompute:
+       int xi_sd = hflip ? (7 - (int)(x_scrolled & 7)) : (int)(x_scrolled & 7);
+       int yi_sd = vflip ? (7 - y_in_tile)             : y_in_tile;
+
+       int tx_sheet_px = (tile_in_sheet & 0xf) * 8 * S + xi_sd * S;  // top-left of SD pixel in HD sheet
+       int ty_sheet_px = (tile_in_sheet >> 4)  * 8 * S + yi_sd * S;
+       int sh_w = (int)sheet->width;
+
+       // Expand the 1 SD pixel into S×S HD pixels with sub-pixel flip.
+       int out_x = sx * S, out_y = sy * S;
+       for (int py = 0; py < S; py++) {
+         int src_py = vflip ? (S - 1 - py) : py;
+         uint32_t *dst_row = (uint32_t *)(dst + (size_t)(out_y + py) * pitch);
+         for (int px = 0; px < S; px++) {
+           int src_px = hflip ? (S - 1 - px) : px;
+           uint8 index = sheet->index_buffer[(ty_sheet_px + src_py) * sh_w + tx_sheet_px + src_px];
+           if (index == 0) continue;  // transparent → leave SD baseline (or whatever lower pass painted)
+           uint16 color = ppu->cgram[palette * 16 + index];
+           uint8 r = ppu->brightnessMult[(color >>  0) & 0x1f];
+           uint8 g = ppu->brightnessMult[(color >>  5) & 0x1f];
+           uint8 b = ppu->brightnessMult[(color >> 10) & 0x1f];
+           dst_row[out_x + px] = (uint32_t)b | ((uint32_t)g << 8) |
+                                 ((uint32_t)r << 16) | 0xff000000u;
          }
        }
      }
-     ```
-
-2. **Refactor `HdCompositor_Draw` to the 11-pass loop.** Replace the existing `for (int layer = 0..3)` sprite loop with the full priority-ordered sequence. Wrap the entire block in `if (g_hd_scale > 1 && PPU_mode(g_my_ppu) == 1)` (mode 7 falls through to SD upscale + sprites-on-top as before).
-
-   The composite function writes directly to `dst` (the main HD buffer) for BG tile passes. Sprite passes continue to use the `g_hd_layer_buf` / `g_hd_shadow_buf` → `AlphaBlit` mechanism from Step 6.
-
-   ```c
-   bool bg3prio = PPU_bg3priority(g_my_ppu) != 0;
-
-   // Pass 1: BG3 lo  (Step 10 adds this)
-   // HdCompositor_BlitBgLayer(dst, pitch, hd_w, hd_h, 2, false, kHdBgLayer_BG3lo, g_my_ppu);
-
-   // Pass 2: Sprite priority 0 (with shadow)
-   HdCompositor_CompositeSpriteLayer(dst, pitch, hd_w, hd_h, 0, g_my_ppu);
-
-   // Pass 3: BG3 hi when !bg3prio  (Step 10 adds this)
-   // if (!bg3prio) HdCompositor_BlitBgLayer(..., kHdBgLayer_BG3hi_noprio, ...);
-
-   // Pass 4: Sprite priority 1
-   HdCompositor_CompositeSpriteLayer(dst, pitch, hd_w, hd_h, 1, g_my_ppu);
-
-   // Pass 5: BG2 lo
-   HdCompositor_BlitBgLayer(dst, pitch, hd_w, hd_h, 1, false, kHdBgLayer_BG2lo, g_my_ppu);
-
-   // Pass 6: BG1 lo
-   HdCompositor_BlitBgLayer(dst, pitch, hd_w, hd_h, 0, false, kHdBgLayer_BG1lo, g_my_ppu);
-
-   // Pass 7: Sprite priority 2
-   HdCompositor_CompositeSpriteLayer(dst, pitch, hd_w, hd_h, 2, g_my_ppu);
-
-   // Pass 8: BG2 hi
-   HdCompositor_BlitBgLayer(dst, pitch, hd_w, hd_h, 1, true,  kHdBgLayer_BG2hi, g_my_ppu);
-
-   // Pass 9: BG1 hi
-   HdCompositor_BlitBgLayer(dst, pitch, hd_w, hd_h, 0, true,  kHdBgLayer_BG1hi, g_my_ppu);
-
-   // Pass 10: Sprite priority 3
-   HdCompositor_CompositeSpriteLayer(dst, pitch, hd_w, hd_h, 3, g_my_ppu);
-
-   // Pass 11: BG3 hi when bg3prio  (Step 10 adds this)
-   // if (bg3prio) HdCompositor_BlitBgLayer(..., kHdBgLayer_BG3hi_prio, ...);
+   }
    ```
 
-   Extract the v1 shadow+sprite per-layer logic into a helper `HdCompositor_CompositeSpriteLayer(dst, pitch, hd_w, hd_h, int oam_prio, const Ppu *ppu)`. Its body is the shadow pre-pass + sprite color pass from Step 6, filtered to `s->layer == oam_prio`.
+   Notes on this structure:
+   - One prio map check per SD pixel. The inner `S×S` block is unconditional once the SD pixel passes the gate. This keeps the hot loop tight.
+   - Per-row tilemap pointer setup amortizes across 256 SD pixels.
+   - **No tile-row early-exit on prio mismatch.** Within an 8-pixel tile, *some* SD pixels may pass the gate (where this layer won) and some may not (where a higher layer occluded). Per-pixel gating is mandatory.
+   - **Performance check:** at S=4, this is `256*240 = 61,440` gate reads × 8 BG passes = ~492K reads/frame. Tile resolution caches well via row-pointer reuse. Acceptable.
 
-3. **No changes to `HdVramMap`.** BG tile resolution uses the same `HdVramMap_ResolveTile` as sprites. BG sheet uploads already go through `UploadGraphicsFiles_UploadGFXFile`, which records them via `HdVramMap_RecordSheetUpload`. No new tracking code is needed for BG1/BG2.
+2. **Add the priority gate to sprite passes.** Modify `HdCompositor_CompositeSpriteLayer` so that the alpha-blit step from work buffer to main buffer skips pixels where `HdDecodeZbuf(g_hd_prio_map[sd_y * 256 + sd_x]) != kHdBgLayer_Spr<oam_prio>`. The cleanest implementation:
+
+   - Add a parameter to `HdCompositor_AlphaBlit`: `HdBgLayerID gate_layer` (or pass `-1` to disable).
+   - When gating is active, for each output HD pixel `(hx, hy)`, compute `sd_x = hx / S`, `sd_y = hy / S`, look up the prio map, and skip the alpha blend if the decoded layer != `gate_layer`.
+
+   Apply to both the shadow alpha-blit and the color alpha-blit. The shadow inherits the same gate as its sprite: a shadow should only render where the sprite itself would render.
+
+   Map `oam_prio` → `HdBgLayerID`:
+   ```c
+   static const HdBgLayerID kHdSpritePrioToLayer[4] = {
+     kHdBgLayer_Spr0, kHdBgLayer_Spr1, kHdBgLayer_Spr2, kHdBgLayer_Spr3,
+   };
+   ```
+
+3. **Default-enable BG1/BG2.** In `hd_compositor.c`:
+   ```c
+   bool g_hd_bg_enabled[3] = { true, true, false };  // BG3 stays off until Step 10
+   ```
+
+4. **No `HdVramMap` changes.** BG1/BG2 use the existing 4bpp 16-word stride. `UploadGraphicsFiles_UploadGFXFile` already records uploads via the v1 hook.
 
 **Gotchas:**
 
-- **Tilemap page selection with large scrolls.** `scrolled_x` or `scrolled_y` can exceed 255 when the scroll is large (e.g. `hs = 400`). The `& 0x100` check for the second page must operate on the *per-tile* scrolled position `(uint)(hs + tc * 8 - (hs & 7))`, not on a screen-pixel coordinate. Use `uint` arithmetic to avoid sign-extension bugs; wrap `scrolled_x >> 3 & 0x1f` for the row/col index within the page.
-- **`pix_x_start` / `pix_y_start` are negative.** A tile that is partially scrolled off the left/top has `screen_tile_x < 0`; individual SD pixels with `sd_x < 0 || sd_y < 0` are skipped by the guards inside the pixel loop. Do not special-case the tile — skip at the *pixel* level.
-- **Priority gate false negative.** If a BG tile has index 0 (transparent) in the HD sheet but the SD version had a non-zero colour, the SD pixel shows through — the priority gate passes but `index == 0 → continue`, leaving the SD upscale pixel intact. Correct behaviour: the SD upscale shows the SD tile where the HD tile is transparent.
-- **Priority gate and sprite overlap.** A sprite at prio 2 standing in front of a BG1 lo tile: the SD pixel at the sprite's location has a *sprite* priority (0xA4xx), not BG1 lo (0x80xx). The gate blocks the BG1 lo tile from overwriting it. Then the sprite compositor (pass 7) blits the HD sprite on top. Correct.
-- **BG tile blitting into `dst` directly (not through the work buffer).** Unlike sprites, BG tile blits write directly into the main HD buffer (equivalent to `alpha=255` immediate overwrite). They don't go through `g_hd_layer_buf` → `AlphaBlit`. Rationale: HD BG tiles fully replace the SD upscale at their locations; no per-layer alpha effects are planned for BG tiles in v2.
-- **`brightnessMult` is the final-scanline value.** Same limitation as sprites (v1 known limitation). Acceptable.
-- **Mode 7 gate.** `PPU_mode(g_my_ppu) == 1` is mode 1. For mode 7, skip all BG passes and use v1 sprite-on-top. Mode 7 frames have no BG1/BG2 in the normal sense.
-- **`HdCompositor_BlitBgLayer` is called directly for each priority tier, not through a work buffer.** Shadow effects on BG tiles are out of scope for v2.
+- **Mosaic.** When `PPU_mosaicEnabled(layer)` and `PPU_mosaicSize > 1`, the SD frame uses block-replicated pixels. HD tile blits ignore mosaic and would render at full HD resolution out of sync with the SD pixel block they replace. Cleanest v2 behavior: **fall back to SD upscale for that layer this frame** (the early-exit guard above). This matches the v2 known limitation.
+- **`g_new_ppu == false`.** Old PPU does not populate `bgBuffers[0]`. The early-exit on `!g_new_ppu` keeps the SD upscale visible; print a one-time warning at startup.
+- **Sprite gate, level6 bit.** Sprite z values include the 0x_6 variant (palette ≥ 4). The cascade decoder maps both 0x_4 and 0x_6 to the same `Spr<n>`, so the gate works without special handling.
+- **Sprites that span priority levels per-pixel.** An OAM sprite is a single priority level — all its pixels get the same z when drawn. The gate treats them uniformly.
+- **Per-pixel gate cost in `HdCompositor_AlphaBlit`.** At HD scale 4, sprite work buffers are 1024×896. The gate division `hx / S` is constant-strength on common scales (S=2,4,8 are bit shifts). Hoist `S` to a local; inline the division as a shift if `S` is a known power of two, else compute `sd_x` once per HD column via outer loop.
+- **Gate failures and HD sprite occlusion by HD BG.** A sprite occluded by a BG tile will have its prio map entry stomped to BGNlo/hi. The sprite gate then fails at those pixels and the BG pass paints. This is correct and *replaces* the post-hoc "BG covers HD sprite" mechanism that would have failed when HD BG sheets had transparent pixels. Verify by placing an HD-mapped sprite at prio 0 behind an HD-mapped BG1hi tile with a partially transparent HD shape: result should show the BG tile shape, no sprite leakage through the BG transparent gaps. If sprite leakage appears, the sprite gate is broken or off.
+- **Index 0 transparency in HD BG sheets.** Pixels with index 0 leave the underlying buffer untouched. Since the buffer started as the SD upscale, transparent HD pixels reveal SD content — correct fall-through.
 
 **Acceptance:**
+
 - Build clean, no new warnings.
-- Yoshi's Island 1 with `gfx/hd/gfx00.png` loaded (the first FG tile sheet): FG tiles that map to sheet 0x00 render in HD. Tiles without HD sheets show the nearest-upscaled SD fallback.
-- A tile with prio=1 and an enemy (prio-2 sprite) in front of it: the HD tile does not occlude the SD enemy — the enemy appears correctly in front of the tile (confirmed by the priority gate).
-- A tile with prio=1 and Mario (prio-2 sprite, if HD Mario sheet is loaded) walking in front: HD Mario renders on top of the HD tile. Correct.
-- Scroll: walk Mario so the camera moves; HD BG tiles scroll smoothly with the background.
-- Disable `g_hd_bg_enabled[0] = false` at compile time: BG1 shows as SD upscale (same as v1). Sprites still HD.
+- Yoshi's Island 1 with at least `gfx00.png` present (FG tiles for that level): tiles backed by sheet 0x00 render at HD scale; tiles without HD show as upscaled SD; visible boundary between HD and SD tiles is sharp but content-correct.
+- Sprite-behind-tile test: HD-mapped sprite prio 0 standing behind HD-mapped BG1hi tile → tile occludes sprite; no transparent-pixel sprite leakage.
+- Sprite-in-front-of-tile test: HD-mapped Mario (prio 2) walking over HD BG1lo tile → Mario fully on top.
+- Scroll test: walk Mario; HD tiles scroll smoothly with the camera.
+- Mosaic test (P-switch end animation, level intro mosaic): mosaic layers fall back to SD upscale; no artifacts.
+- Compile-time `g_hd_bg_enabled[0] = false`: BG1 returns to SD upscale; sprites unaffected.
 
 ---
 
 ### Step 10 — 2bpp tile support + BG3 compositor
 
-**Goal:** Extend `HdVramMap` to handle 2bpp tile addresses (BG3 in mode 1 uses 8 VRAM words per tile rather than 16). Hook `UploadGraphicsFiles_Layer3` to record BG3 sheet uploads. Add BG3 to the priority-ordered compositor pass.
+**Goal:** track BG3 (2bpp) sheets in `HdVramMap` with the correct 8-word/tile stride, hook `UploadGraphicsFiles_Layer3` to record sheet uploads, and add the BG3 variant of `HdCompositor_BlitBgLayer`. Wire the BG3 passes (1, 3, 11) in the loop.
 
 **Read first:**
-- [src/snes/ppu.c: `PpuDrawBackground_2bpp`](src/snes/ppu.c) — 2bpp tile address formula: `(ta + tile_num * 8) & 0x7fff`. kPaletteShift = 8; palette contribution to z-value is `(tile & 0x1c00) >> 8` (0..7 directly, not ×16). Pixel range 1..3.
-- [src/smw_00.c: `UploadGraphicsFiles_Layer3`](src/smw_00.c) — calls `SmwCopyToVram(0x4000 + i * 0x400, GraphicsDecompress(40 + i), 0x800)` for i=0..3. Sheets 0x28..0x2B (decimal 40..43), VRAM word addresses 0x4000, 0x4400, 0x4800, 0x4C00. Each upload is 0x800 bytes = 0x400 VRAM words = 64 tiles at 8 words/tile (2bpp).
-- [src/hd_vram_map.h](src/hd_vram_map.h) — current `HdVramRegion` struct; `ResolveTile` assumes 16-word stride.
-- Step 9 output — `HdCompositor_BlitBgLayer` and the 11-pass loop with the BG3 passes commented out.
+- [src/snes/ppu.c: `PpuDrawBackground_2bpp`](src/snes/ppu.c#L300) — 2bpp address formula `(ta + tile * 8) & 0x7fff`; `kPaletteShift = 8` ⇒ `(tile & 0x1c00) >> 8` = `palette << 2` ⇒ palette base `palette * 4` in CGRAM.
+- [src/smw_00.c: `UploadGraphicsFiles_Layer3`](src/smw_00.c) — calls `SmwCopyToVram(0x4000 + i*0x400, GraphicsDecompress(40 + i), 0x800)` for i=0..3. Sheets gfx28..gfx2B.
+- [src/hd_vram_map.h](src/hd_vram_map.h) — current `HdVramRegion` (no stride), `HdVramMap_ResolveTile` (hard-codes `/16`).
+- Step 9b output.
 
-**Key facts:**
-
-- BG3 is 2bpp. Each tile occupies 8 VRAM words (not 16). The VRAM address of tile N is `(PPU_bgTileAdr(ppu, 2) + N * 8) & 0x7fff`.
-- The existing `HdVramMap_ResolveTile` finds a region and computes `tile_in_sheet = (vram_word_addr - region.vram_word_addr) / 16`. This division by 16 is wrong for 2bpp tiles; it would halve the tile index.
-- Sheet gfx28..gfx2B are 2bpp *source* tiles. When loaded as HD PNGs they are encoded the same way as 4bpp sheets (one index byte per pixel, index 0 = transparent). Max index = 3 (2bpp).
-- BG3 palettes: `palette * 4` CGRAM base (4 entries per 2bpp tile), not `palette * 16`. The palette index in the tilemap entry is bits 12–10 (same bits as 4bpp), but each palette has only 4 colours.
-- `UploadGraphicsFiles_Layer3` uses `SmwCopyToVram` (Path B), not `UploadGraphicsFiles_UploadGFXFile` (Path A). The current VRAM map has no staging entry for sheets 0x28..0x2B.
+**Why we hook Layer3 directly (Path A) rather than via the existing Path B staging-buffer mechanism:** `UploadGraphicsFiles_Layer3` uses `SmwCopyToVram` (Path B), but BG3 source pointers (output of `GraphicsDecompress(40+i)`) are not registered in the staging-buffer registry — only sheet 0x32 is. We could register four more staging buffers, but the sources for BG3 are dynamically allocated/decompressed, complicating lifetime tracking. A direct `HdVramMap_RecordSheetUpload` call at the end of `UploadGraphicsFiles_Layer3` is the simpler, more robust choice. Document this in the function with a one-line comment so the next reader knows why both paths exist for similar uploads.
 
 **Tasks:**
 
-1. **Extend `HdVramRegion` with a `tile_stride` field.** In [src/hd_vram_map.h](src/hd_vram_map.h):
+1. **Add `tile_stride` to `HdVramRegion`.** [src/hd_vram_map.h](src/hd_vram_map.h):
    ```c
    typedef struct HdVramRegion {
      uint16 vram_word_addr;
      uint16 tile_count;
      uint8  sheet_id;
      uint16 src_tile_offset;
-     uint8  tile_stride;   // NEW: VRAM words per tile: 8 (2bpp) or 16 (4bpp)
+     uint8  tile_stride;   // VRAM words/tile: 16 (4bpp) or 8 (2bpp)
    } HdVramRegion;
    ```
-   Existing callers of `HdVramMap_RecordSheetUpload` do not pass a stride; add a `tile_stride` parameter (default 16). Update all call sites — currently only `UploadGraphicsFiles_UploadGFXFile`.
 
-2. **Update `HdVramMap_ResolveTile` to use the stride.** Replace the hard-coded `/ 16` with `/ region->tile_stride`. No change to the resolution algorithm otherwise.
-
-3. **Add `HdVramMap_RecordSheetUpload_2bpp` (or add a stride parameter to the existing function).** Prefer a single function with an explicit `tile_stride` parameter. Update the existing call in [src/smw_00.c](src/smw_00.c):
+2. **Add `tile_stride` parameter to `HdVramMap_RecordSheetUpload`.** Update the existing call in `UploadGraphicsFiles_UploadGFXFile`:
    ```c
-   HdVramMap_RecordSheetUpload(dst_addr, j, 0, 128, 16);   // 4bpp as before
+   HdVramMap_RecordSheetUpload(dst_addr, j, 0, 128, /*tile_stride=*/16);
    ```
+   Plus the Path B variant `HdVramMap_RecordCopyFromStaging` — verify whether it also needs a stride argument. (For SMW, all staging-registered sheets are 4bpp, so a constant 16 there is acceptable.)
 
-4. **Hook `UploadGraphicsFiles_Layer3`.** At the end of the function body, after the four `SmwCopyToVram` calls, add:
+3. **Update `HdVramMap_ResolveTile`** to use the per-region stride:
    ```c
-   // Record BG3 (2bpp) sheet uploads in the HD VRAM map.
+   tile_in_sheet = (vram_word_addr - region->vram_word_addr) / region->tile_stride + region->src_tile_offset;
+   ```
+   No other change to the resolution algorithm.
+
+4. **Hook `UploadGraphicsFiles_Layer3`.** In [src/smw_00.c](src/smw_00.c), at the end of the function (after the four `SmwCopyToVram` calls and before any unrelated `UploadGraphicsFiles_UploadGFXFile(0x6000, …)` sprite call):
+   ```c
+   // HD compositor: record BG3 (2bpp) sheets. Hooked here directly rather than via
+   // the SmwCopyToVram path because BG3 source pointers are not registered in the
+   // staging registry (only sheet 0x32 is).
    for (int i = 0; i < 4; i++)
-     HdVramMap_RecordSheetUpload((uint16)(0x4000 + i * 0x400), (uint8)(0x28 + i),
-                                 0, 64, 8);  // 64 tiles, 8 words/tile (2bpp)
+     HdVramMap_RecordSheetUpload((uint16)(0x4000 + i * 0x400),
+                                 (uint8)(0x28 + i), 0, /*tile_count=*/64,
+                                 /*tile_stride=*/8);
    ```
-   This covers sheets gfx28..gfx2B at VRAM word addresses 0x4000..0x4C00.
 
-5. **`HdCompositor_BlitBgLayer` for BG3.** Add a `tile_stride` parameter (or detect BG3 via `bg_layer == 2`). The only changes from the BG1/BG2 path are:
-   - `tile_vram = (PPU_bgTileAdr(ppu, 2) + tile_num * 8) & 0x7fff` (stride 8, not 16).
-   - `pal_base = palette * 4` (4 entries per 2bpp palette).
-   - Max valid index in the HD sheet is 3 (2bpp), but index 0 is always transparent — same `if (index == 0) continue;` guard applies.
+5. **Add a BG3 variant of `HdCompositor_BlitBgLayer`.** Easiest approach: parameterize the existing function by `tile_stride` and `palette_size` (16 for 4bpp, 4 for 2bpp). Internal differences:
+   - `tile_vram = (PPU_bgTileAdr(ppu, 2) + tile_num * tile_stride) & 0x7fff`.
+   - `cgram_base = palette * palette_size`.
+   - HD sheet tile_count for 2bpp sheets: 64 (one full sheet).
+   - Index 0 always transparent — same guard.
 
-6. **Enable BG3 in the 11-pass loop.** Uncomment the three BG3 pass calls added in Step 9 (passes 1, 3, and 11). Set `g_hd_bg_enabled[2] = true` default in `hd_compositor.c`.
+   Pass `tile_stride` and `palette_size` from the caller; or split into `HdCompositor_BlitBgLayer_4bpp` and `HdCompositor_BlitBgLayer_2bpp` if the parameterization gets messy. Either is fine — pick whichever keeps the inner loop readable.
 
-7. **Update `HdCompositor_ApplyConfig`** to read a new config field `g_config.hd_bg_enabled[3]` (added in Step 12) into `g_hd_bg_enabled[0..2]`.
+6. **Wire BG3 passes (1, 3, 11) in `HdCompositor_Draw`** (uncomment the stubs from Step 9a). Also default-enable BG3:
+   ```c
+   bool g_hd_bg_enabled[3] = { true, true, true };
+   ```
 
 **Gotchas:**
-- **Stride mismatch is silent.** If you forget to update a `HdVramMap_ResolveTile` call site, tiles silently misidentify (wrong tile number returned). Cross-check by dumping tile resolutions for a known BG3 tile at the Yoshi's Island 1 title box.
-- **`UploadGraphicsFiles_Layer3` first uploads four Layer 3 text/number sheets, then calls `UploadGraphicsFiles_UploadGFXFile(0x6000, 0, 0)`.** The `UploadGraphicsFiles_UploadGFXFile` call is for the sprite slot at 0x6000, not BG3. Do not confuse the two. Only record the four 0x4000-series VRAM words as 2bpp BG3 uploads.
-- **BG3 in SMW is primarily used for Layer 3 foreground overlays (star world text, message boxes) and some title-screen elements.** It is rarely the primary visual interest. Disable with `g_hd_bg_enabled[2] = false` in the config default if BG3 HD sheets are not available.
-- **`PPU_bgTileAdr(ppu, 2)`** macro: `(ppu->bgTileAdr >> 8 & 0xf) << 12`. Standard macro from ppu.h; do not recompute manually.
+
+- **Stride mismatch is silent.** Forget to update one `RecordSheetUpload` call site and tiles silently misidentify (off by a factor of 2). Add a one-time `HdVramMap_Dump` line for known BG3 VRAM addresses (0x4000–0x4FFF) to verify resolution after this step.
+- **`UploadGraphicsFiles_Layer3` may end with `UploadGraphicsFiles_UploadGFXFile(0x6000, 0, 0)`** for the *sprite* slot at 0x6000 — that is unrelated to BG3 and is already hooked by the v1 mechanism. Do not record it as 2bpp.
+- **BG3 palette overlap.** SNES BG3 palettes (8 × 4 entries = 32 colors) live in CGRAM 0..31, overlapping BG1/BG2 palettes 0–1. This is normal SNES behavior; the HD path simply uses `cgram[palette*4 + index]`, which produces the correct color even with overlap.
+- **2bpp pixel range is 1..3.** `if (index == 0) continue;` covers transparent. Indices 4..15 in a 2bpp sheet PNG would be a sheet-encoding bug — emit a stderr warning at sheet load time if any pixel ≥ 4 appears in a 2bpp sheet (sheet IDs 0x28..0x2B).
+- **SMW BG3 usage:** message boxes, status/HUD numbers, some title-screen text. Often empty (z = backdrop) on most pixels. The compositor will gate-fail on most pixels and exit fast.
 
 **Acceptance:**
+
 - Build clean.
-- With gfx28.png present: Layer 3 text tiles (e.g. "MARIO" HUD letters, if BG3 carries them in the current level) render in HD with correct 2bpp palette colours.
-- Confirm `HdVramMap_ResolveTile` returns the correct `tile_in_sheet` for a known 2bpp tile (add a temporary debug print keyed to a specific BG3 VRAM address from the `HdVramMap_Dump` output).
-- 4bpp resolution is unaffected: sprite and BG1/BG2 tile mapping continues to return the same results as after Step 9.
+- With gfx28.png present and HD scale > 1: BG3 message-box / "SUPER MARIO WORLD" letters render at HD scale.
+- 4bpp resolution unchanged: sprites and BG1/BG2 still render correctly (regression test).
+- `HdVramMap_Dump` shows entries for VRAM addresses 0x4000, 0x4400, 0x4800, 0x4C00 with `tile_stride=8` and `sheet_id` 0x28..0x2B respectively.
 
 ---
 
 ### Step 11 — Overworld map tile tracking
 
-**Goal:** Identify and hook the graphics upload paths used by the overworld map screen so that `g_hd_prio_map` and the BG tile VRAM map cover overworld tile graphics. The BG tile compositor introduced in Steps 9–10 then works for overworld without further changes.
+**Goal:** identify how the overworld map screen uploads its tile graphics, ensure those uploads register with `HdVramMap`, and verify the BG compositor renders overworld tiles in HD when sheets are present.
 
-**Read first:**
-- The overworld map likely loads its own set of FG/BG sheets via a code path separate from `UploadGraphicsFiles`. Search for calls to `UploadGraphicsFiles_UploadGFXFile` and `SmwCopyToVram` that execute only during the overworld screen transition:
-  ```
-  grep -n "UploadGraphicsFiles\|SmwCopyToVram\|overworld\|ow_" src/smw_0*.c | head -80
-  ```
-- [src/smw_00.c: near `UploadGraphicsFiles`](src/smw_00.c) — look for the overworld-specific graphics upload routine (often named after "overworld" or "OW" in the ROM labels). It may call `UploadGraphicsFiles_UploadGFXFile` with a different GFX list, or bypass it entirely.
-- [src/variables.h](src/variables.h) — look for `ow_` prefixed globals related to the overworld tile graphics setting.
-
-**Context (to be confirmed by investigation):**
-
-The overworld uses mode 1 (same as levels) with BG1 and BG2 carrying the overworld map tiles, and BG3 carrying path/icon overlays. The graphics sheets loaded for the overworld are different from the in-level sheets (different entries from the FG/BG GFX lists, or dedicated overworld sheets). If `UploadGraphicsFiles_UploadGFXFile` is already called with the overworld sheet IDs and the correct VRAM destinations, no additional hooking is needed — the VRAM map already records them.
-
-If overworld uploads go through a *different* code path (e.g. a direct memcpy to `RtlGetVramAddr()`), those uploads are invisible to the VRAM map and must be hooked individually.
+**Why this is investigative, not prescriptive:** the overworld may use the same `UploadGraphicsFiles_*` helpers (Path A or B), in which case it is already hooked, or it may use a dedicated path that needs a new hook. Until we trace the real call graph, the prescriptive plan would be guesswork.
 
 **Tasks:**
 
-1. **Identify the overworld graphics upload function.** Use the grep above; trace calls from the main overworld loop. Likely candidates: `UploadGraphicsFiles_Overworld` or similar. Check whether it ultimately calls `UploadGraphicsFiles_UploadGFXFile`.
+1. **Trace overworld graphics upload.** Suggested investigation:
+   ```sh
+   grep -n "Overworld\|overworld\|ow_" src/smw_0*.c | grep -iE "upload|gfx|vram"
+   grep -n "UploadGraphicsFiles\|SmwCopyToVram" src/smw_0*.c | head -80
+   ```
+   Identify any function that runs only during the overworld screen's GFX init or transitions to/from it. Cross-reference with [src/variables.h](src/variables.h) for `ow_`-prefixed globals and game-mode variables (typically `gameMode == 0x0E` or similar for overworld).
 
-2. **If it calls `UploadGraphicsFiles_UploadGFXFile`:** No additional tracking code needed. Verify by checking the debug dump (`HdVramMap_Dump`) while on the overworld screen — it should show regions for the overworld sheets.
+2. **Classify the upload path:**
+   - **Path A (no new code):** if the function ultimately calls `UploadGraphicsFiles_UploadGFXFile`, the existing hook records it. Verify by checking `HdVramMap_Dump` while on the world map.
+   - **Path B (existing hook):** if it uses `SmwCopyToVram` with sources already in the staging registry, the existing hook records it.
+   - **New path:** if it writes to VRAM directly via `RtlGetVramAddr()` or a unique helper, add `HdVramMap_RecordSheetUpload` at the end of that function with the appropriate stride.
 
-3. **If it writes to VRAM directly (bypassing the hook):** Add a `HdVramMap_RecordSheetUpload(dst_addr, sheet_id, 0, tile_count, 16)` call at the end of the direct-write function, mirroring the hook already added to `UploadGraphicsFiles_UploadGFXFile`.
+3. **Verify rendering on the overworld.** Walk to a node, enter and exit a level, return to the overworld. Confirm `HdVramMap_Dump` shows the overworld sheet regions. Confirm HD overworld tiles render where sheets are present.
 
-4. **Verify BG tile compositor on the overworld.** Navigate to the world map; confirm that HD overworld tiles render where sheets are loaded and the priority map shows the expected layer IDs.
+4. **Document the finding.** In a comment near the hook (or in the function itself), record which upload mechanism the overworld uses, so future readers don't repeat the investigation.
 
 **Acceptance:**
-- With overworld HD sheets present: overworld map tiles render in HD.
-- Entering a level and returning to the overworld does not corrupt tile resolution — `HdVramMap_Reset` (called at level load, or via `HdCompositor_Init`) clears stale regions; the overworld upload re-records fresh regions.
-- No regression in level BG tile resolution after the overworld path is hooked.
+
+- With overworld HD sheets present: overworld map tiles render in HD at the correct positions.
+- Round-trip (overworld → level → overworld): no stale VRAM map regions cause incorrect resolution. `HdVramMap_Reset` (called per-level-load if it exists, or on `HdCompositor_Init`) ensures a clean slate.
+- If the path turns out to need a new hook, that hook is added and documented; if not, the investigation is recorded in a comment so the next person knows it was checked.
+- If hooking is not feasible in this step, document overworld as "SD baseline only — HD overworld pending" in the v2 known limitations and proceed.
 
 ---
 
 ### Step 12 — Config + INI extensions (v2)
 
-**Goal:** Expose BG layer HD enable/disable toggles in `smw.ini`. Add a runtime hotkey to toggle BG HD rendering. Extend `HdCompositor_ApplyConfig` to read the new keys.
+**Goal:** expose BG layer enables in `smw.ini`, apply them in `HdCompositor_ApplyConfig`, add a runtime hotkey for cycling BG HD on/off.
 
-**Read first:**
-- Step 7 output — `HandleIniConfig` section-1 dispatch, `ParseBool`, `kDefaultKbdControls`, `kKeyNameId`, `HandleCommand`.
-- [src/config.h](src/config.h) — add new fields adjacent to the existing HD block.
+**Read first:** Step 7 outputs — `HandleIniConfig` section-1 dispatch, `ParseBool`, `kDefaultKbdControls`, `kKeyNameId`, `HandleCommand`.
 
 **Tasks:**
 
-1. **Extend `Config` struct** ([src/config.h](src/config.h)):
+1. **Extend `Config`** ([src/config.h](src/config.h)):
    ```c
-   // v2 HD BG tile replacement
-   bool hd_bg_enabled[3];   // [0]=BG1, [1]=BG2, [2]=BG3. Default: true, true, false.
+   bool hd_bg_enabled[3];   // [0]=BG1, [1]=BG2, [2]=BG3
    ```
-   Set defaults in `ParseConfigFile` before `ParseOneConfigFile` runs:
+   Defaults in `ParseConfigFile` (before `ParseOneConfigFile`):
    ```c
    g_config.hd_bg_enabled[0] = true;
    g_config.hd_bg_enabled[1] = true;
-   g_config.hd_bg_enabled[2] = false;
+   g_config.hd_bg_enabled[2] = true;
    ```
 
-2. **Parse `HdBgLayers` in `HandleIniConfig` section 1.** Comma-separated 3-bool list (e.g. `1,1,0`):
-   ```c
-   // "HdBgLayers = 1,1,0"
-   for (int i = 0; i < 3 && value; i++) {
-     ParseBool(value, &g_config.hd_bg_enabled[i]);
-     value = NextDelim(&value, ',');
-   }
-   ```
+2. **Parse `HdBgLayers` in `HandleIniConfig` section 1.** Comma-separated 3-bool list (e.g. `1,1,0`). Follow the existing comma-list parsing pattern used elsewhere in section 1.
 
 3. **Apply in `HdCompositor_ApplyConfig`:**
    ```c
@@ -1437,46 +1504,50 @@ If overworld uploads go through a *different* code path (e.g. a direct memcpy to
      g_hd_bg_enabled[i] = g_config.hd_bg_enabled[i];
    ```
 
-4. **Add `kKeys_ToggleHdBg` hotkey** (Ctrl+B by default). Follow the Step 7 pattern: enum entry, default binding, `kKeyNameId` entry, `HandleCommand` case:
+4. **Add `kKeys_ToggleHdBg` hotkey (Ctrl+B by default).** Mirror the Step 7 pattern: enum entry, default binding in `kDefaultKbdControls`, name in `kKeyNameId`, `HandleCommand` case. **The simpler two-state cycle:**
    ```c
    case kKeys_ToggleHdBg: {
-     // Cycle through: all-on → sprites-only → all-off → all-on
-     bool any = g_hd_bg_enabled[0] || g_hd_bg_enabled[1] || g_hd_bg_enabled[2];
-     bool spr_only = !any;
-     if (any && (g_hd_bg_enabled[0] || g_hd_bg_enabled[1])) {
+     bool any_on = g_hd_bg_enabled[0] || g_hd_bg_enabled[1] || g_hd_bg_enabled[2];
+     if (any_on) {
        g_hd_bg_enabled[0] = g_hd_bg_enabled[1] = g_hd_bg_enabled[2] = false;
-       fprintf(stderr, "HD BG tiles: OFF (sprites only)\n");
+       fprintf(stderr, "HD BG tiles: OFF\n");
      } else {
        g_hd_bg_enabled[0] = g_config.hd_bg_enabled[0];
        g_hd_bg_enabled[1] = g_config.hd_bg_enabled[1];
        g_hd_bg_enabled[2] = g_config.hd_bg_enabled[2];
-       fprintf(stderr, "HD BG tiles: ON\n");
+       fprintf(stderr, "HD BG tiles: ON (per INI)\n");
      }
      break;
    }
    ```
+   (The original three-state "all-on → sprites-only → all-off" cycle was specified but the example code only flipped between two states. Two states is simpler and matches what the example actually did.)
 
 5. **Document in `smw.ini`** under `[Graphics]`, after the existing HD sprite keys:
    ```ini
    # HD background tile replacement (requires matching PNGs in HdGfxDir).
    # Comma-separated per-layer toggles: BG1, BG2, BG3.
-   HdBgLayers = 1,1,0
+   HdBgLayers = 1,1,1
    ```
 
 **Acceptance:**
-- `HdBgLayers = 0,0,0` in INI: game runs with HD sprites only (v1 behaviour). BG passes all early-exit.
-- `HdBgLayers = 1,1,0`: BG1 and BG2 tiles render in HD where sheets are present; BG3 stays SD.
-- Ctrl+B at runtime: toggles BG tile rendering on/off without restarting.
+
+- `HdBgLayers = 0,0,0`: BG passes all early-exit; HD sprites only (v1-equivalent visual modulo the SD-sprite-baseline change from Step 9a).
+- `HdBgLayers = 1,1,1` (default): BG layers render in HD where sheets present; SD upscale where not.
+- Ctrl+B at runtime: toggles BG tile rendering between INI-defined state and OFF without restarting.
 - Build clean.
 
 ---
 
 ## Known Limitations (v2 additions)
 
-- **Mode 7 BG rendering is never replaced** with HD content. Bowser fight and overworld rotation/zoom scenes show nearest-upscaled SD BG + HD sprites (sprites-on-top, same as v1).
-- **Window masking is not applied to HD BG tiles.** A BG tile partially hidden by a colour window renders its full 8×8 area in HD regardless.
-- **Subscreen / colour math.** HD BG tiles do not participate in add/subtract colour math with the subscreen. Pixels that would be colour-blended in SD appear as plain CGRAM colours in HD.
-- **Per-scanline brightness ramp on BG tiles.** Same limitation as HD sprites: `brightnessMult` reflects only the last rendered scanline. HDMA-driven mid-frame brightness changes affect BG tiles imprecisely.
-- **Transparent HD BG tile pixels expose the SD upscale.** Where an HD sheet has index 0 at a given tile position, the SD nearest-upscale pixel shows. This is intentional: it allows partial HD coverage without visual gaps, at the cost of potential SD/HD mismatch at transparent-pixel boundaries.
-- **BG3 (2bpp) HD replacement requires explicit opt-in** (`HdBgLayers = 1,1,1`) because BG3 sheets are rarely the primary visual content. Disable by default to avoid user-visible issues when gfx28..gfx2B PNGs are absent.
-- Sub-pixel smooth scrolling for HD BG.
+- **Color math is not reproduced for HD tiles.** Underwater overlays, fade transitions, half-color smoke, and other subscreen-blended effects show pure CGRAM colors on HD tiles while surrounding SD content blends correctly. Visible discontinuity at the boundary. (See "Color-math caveat" above the steps.)
+- **Mosaic-affected layers fall back to SD upscale for the duration of mosaic.** P-switch end animation and level-intro fades briefly drop HD on the mosaiced layer.
+- **Mode 7 BG rendering is never replaced.** Bowser fight, OW rotation/zoom: full SD frame nearest-upscaled; HD sprites still composite on top using the v1 sprite-on-top fallback path.
+- **Animated tile graphics are not tracked in the VRAM map.** Water/lava/coin/animated-block VRAM is uploaded by `UploadLevelExAnimationData` and `UploadOverworldExAnimationData` and not currently registered. Those tiles always show as upscaled SD. Content is never missing.
+- **Window masking is not applied to HD BG tiles.** A BG tile partially hidden by a color window renders its full 8×8 area at HD.
+- **Subscreen HD replacement is out of scope.** Only main-screen content gets HD treatment.
+- **Per-scanline brightness ramp.** `brightnessMult` reflects only the last scanline of the frame; HDMA-driven mid-frame brightness ramps are not applied per-scanline to HD content.
+- **Old PPU (`g_new_ppu == false`) disables HD BG.** Falls back to v1 sprite-only on top of upscaled SD. Warning printed at startup.
+- **Sub-pixel smooth scrolling for HD BG is not implemented.** HD BG tiles snap to SD-pixel-aligned positions; smooth sub-pixel motion across an HD tile would require interpolation in the blit, deferred.
+- **Transparent HD tile pixels reveal SD content underneath.** This is the correct fall-through behavior, but visible as resolution mismatch at sheet alpha boundaries. Authors should keep HD sheet alpha shapes ≥ SD tile shapes if they want pure HD coverage.
+
