@@ -37,6 +37,10 @@ bool  g_hd_enabled      = true;
 uint8 g_hd_scale        = 1;
 bool  g_hd_skip_sprites = false;
 
+// v2: per-pixel priority z-buffer.
+uint16 *g_hd_prio_map  = NULL;
+bool    g_hd_bg_enabled[3] = { false, false, false };  // enabled in Step 9b/10
+
 // ---------------------------------------------------------------------------
 // Per-layer effect configuration (file-static; Step 7 hooks INI to mutate).
 // ---------------------------------------------------------------------------
@@ -74,6 +78,26 @@ static void HdCompositor_EnsureBuffers(int hd_w, int hd_h) {
   g_hd_buf_height = hd_h;
 }
 
+// ---------------------------------------------------------------------------
+// Priority z-buffer decoder (v2 Step 8).
+// Uses cascaded >= thresholds; handles the 0x_6 level6 sprite variant.
+// ---------------------------------------------------------------------------
+HdBgLayerID HdDecodeZbuf(uint16 z) {
+  uint8 hi = (uint8)(z >> 8);
+  if (hi >= 0xF2) return kHdBgLayer_BG3hi_prio;
+  if (hi >= 0xE4) return kHdBgLayer_Spr3;        // 0xE4 or 0xE6 (level6)
+  if (hi >= 0xC0) return kHdBgLayer_BG1hi;
+  if (hi >= 0xB1) return kHdBgLayer_BG2hi;
+  if (hi >= 0xA4) return kHdBgLayer_Spr2;        // 0xA4 or 0xA6
+  if (hi >= 0x80) return kHdBgLayer_BG1lo;
+  if (hi >= 0x71) return kHdBgLayer_BG2lo;
+  if (hi >= 0x64) return kHdBgLayer_Spr1;        // 0x64 or 0x66
+  if (hi >= 0x32) return kHdBgLayer_BG3hi_noprio;
+  if (hi >= 0x24) return kHdBgLayer_Spr0;        // 0x24 or 0x26
+  if (hi >= 0x12) return kHdBgLayer_BG3lo;
+  return kHdBgLayer_Backdrop;                     // 0x00 (pre-clear) or 0x05 (ClearBackdrop)
+}
+
 void HdCompositor_ApplyConfig(void) {
   g_hd_enabled = g_config.hd_gfx_enabled;
   for (int i = 0; i < 4; i++) {
@@ -94,6 +118,8 @@ void HdCompositor_Shutdown(void) {
   g_hd_shadow_buf = NULL;
   g_hd_buf_width  = 0;
   g_hd_buf_height = 0;
+  free(g_hd_prio_map);
+  g_hd_prio_map = NULL;
 }
 
 bool HdCompositor_Toggle(void) {
@@ -110,6 +136,9 @@ void HdCompositor_Init(void) {
     fprintf(stderr, "HD enabled but no HD sheets loaded from '%s' "
                     "(scale=1); falling back to SD.\n", hd_dir);
   }
+  // v2 Step 8: allocate per-scanline priority z-buffer.
+  if (!g_hd_prio_map)
+    g_hd_prio_map = (uint16 *)malloc(256 * 240 * sizeof(uint16));
 }
 
 void HdCompositor_Draw(uint8 *dst, size_t pitch,
@@ -308,6 +337,12 @@ static void HdCompositor_DebugDump(const HdScene *scene) {
           frame_counter, scene->count, g_hd_scale);
   HdVramMap_Dump();
 
+  // v2 Step 8: sample the priority map at screen centre as a quick sanity check.
+  if (g_hd_prio_map) {
+    uint16 z = g_hd_prio_map[112 * 256 + 128];
+    fprintf(stderr, "  prio_map[112,128] = 0x%04x -> layer %d\n", z, (int)HdDecodeZbuf(z));
+  }
+
   fprintf(stderr, "----- Scene -----\n");
   for (int i = 0; i < scene->count; i++) {
     const HdSprite *s = &scene->sprites[i];
@@ -370,4 +405,13 @@ static void HdCompositor_DebugDump(const HdScene *scene) {
   }
   fprintf(stderr, "----- End HD Debug -----\n");
   fflush(stderr);
+}
+
+// ---------------------------------------------------------------------------
+// Priority map diagnostic accessor (Step 8).
+// ---------------------------------------------------------------------------
+HdBgLayerID HdGetPrioMapSample(int sd_x, int sd_y) {
+  if (!g_hd_prio_map) return kHdBgLayer_Backdrop;
+  if ((unsigned)sd_x >= 256 || (unsigned)sd_y >= 240) return kHdBgLayer_Backdrop;
+  return HdDecodeZbuf(g_hd_prio_map[sd_y * 256 + sd_x]);
 }

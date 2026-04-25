@@ -183,6 +183,10 @@ static SDL_HitTestResult HitTestCallback(SDL_Window *win, const SDL_Point *pt, v
 void RtlDrawPpuFrame(uint8 *pixel_buffer, size_t pitch, uint32 render_flags) {
   bool hd_active = g_hd_enabled && g_hd_scale > 1;
   g_hd_skip_sprites = hd_active;
+  // v2 Step 8: clear priority map before the PPU runs so forced-blank scanlines
+  // stay as kHdBgLayer_Backdrop (z=0) and never pass any HD gate.
+  if (hd_active && g_hd_prio_map)
+    memset(g_hd_prio_map, 0, 256 * 240 * sizeof(uint16));
   g_rtl_game_info->draw_ppu_frame();
 
   uint8 *ppu_pixels = g_other_image ? g_my_pixels : g_pixels;
