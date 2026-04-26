@@ -105,6 +105,28 @@ assets/
 
 ---
 
+## HD / Upscaled Feature Guidelines
+
+These rules apply to all new work on the upscaled rendering pipeline.
+
+### Where new code lives
+
+All new code related to the upscaled and enhanced version of the game must live in **`src/hd/`**. Do not add HD-related logic to any file outside that directory. The only permitted exceptions are the minimal hook points already present in `main.c`, `common_rtl.c`, and `smw_00.c` that bridge the 1:1 implementation to the HD layer.
+
+### Separation of concerns
+
+The SMW 1:1 reimplementation (`smw_*.c`, `common_rtl.c`, `smw_rtl.c`, `snes/`) is treated as **read-only** from the HD layer's perspective. The HD code observes game state; it never mutates it. New features are always **additive** — appending rendering passes or decorators on top of the existing pipeline, not modifying original game logic.
+
+### Primary rendering interface
+
+`HdRenderInput` (defined in `src/hd/hd_frame.h`) is the canonical input to the compositor for every frame. The structs `HdFrameSnapshot`, `HdGameState`, `HdScene`, and `HdTextItem` are the contract between the game-state reader (`HdFrame_Build`) and every downstream blit or effect function. New rendering features must consume `HdRenderInput`; they must not reach back into raw game globals or PPU internals directly.
+
+### Unit testing requirement
+
+Every new module added under `src/hd/` must have a corresponding test file under `tests/`. New code is not considered done until unit-test coverage for that module is **≥ 80%**. Pure rendering helpers that have no branching logic are exempt, but any function with conditional paths must be covered. Tests must be runnable in isolation without a live SDL2 window or the game ROM.
+
+---
+
 ## HD Graphics (branch: `experiment/hd`)
 
 The `experiment/hd` branch adds an HD sprite and background rendering pipeline on top of the base game. The full implementation plan is in `HD_GRAPHICS_SPEC.md`. Summary below.
