@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+extern bool g_new_ppu;  // defined in main.c; true = new PPU with bgBuffers populated
+
 static HdScene g_hd_scene;
 
 // ---------------------------------------------------------------------------
@@ -22,9 +24,11 @@ typedef enum {
 
 // Forward declarations — defined after HdCompositor_Draw.
 static void HdCompositor_DebugDump(const HdScene *scene);
+// gate_layer: if >= 0, only blit pixels where HdDecodeZbuf(prio_map) == gate_layer.
+// Pass -1 to blit unconditionally (no gate).
 static void HdCompositor_AlphaBlit(uint8 *dst, size_t dst_pitch,
                                    const uint8 *src, size_t src_pitch,
-                                   int w, int h);
+                                   int w, int h, int gate_layer);
 static void HdCompositor_BlitSprite(uint8 *dst_buf, size_t dst_pitch,
                                     int dst_w, int dst_h,
                                     const HdSprite *s,
@@ -32,6 +36,14 @@ static void HdCompositor_BlitSprite(uint8 *dst_buf, size_t dst_pitch,
                                     int16 offset_x, int16 offset_y,
                                     uint8 sil_r, uint8 sil_g, uint8 sil_b, uint8 sil_a,
                                     const Ppu *ppu);
+static void HdCompositor_CompositeSpriteLayer(uint8 *dst, size_t pitch,
+                                              int hd_w, int hd_h,
+                                              int oam_prio, const Ppu *ppu);
+static void HdCompositor_BlitBgLayer(uint8 *dst, size_t pitch,
+                                     int hd_w, int hd_h,
+                                     int bg_layer, bool prio_hi,
+                                     HdBgLayerID expected_layer,
+                                     const Ppu *ppu);
 
 bool  g_hd_enabled      = true;
 uint8 g_hd_scale        = 1;
@@ -39,7 +51,12 @@ bool  g_hd_skip_sprites = false;
 
 // v2: per-pixel priority z-buffer.
 uint16 *g_hd_prio_map  = NULL;
-bool    g_hd_bg_enabled[3] = { false, false, false };  // enabled in Step 9b/10
+bool    g_hd_bg_enabled[3] = { true, true, false };   // BG3 stays off until Step 10
+
+// Map OAM priority 0..3 to the corresponding HdBgLayerID for the sprite priority gate.
+static const HdBgLayerID kHdSpritePrioToLayer[4] = {
+  kHdBgLayer_Spr0, kHdBgLayer_Spr1, kHdBgLayer_Spr2, kHdBgLayer_Spr3,
+};
 
 // ---------------------------------------------------------------------------
 // Per-layer effect configuration (file-static; Step 7 hooks INI to mutate).
@@ -145,59 +162,51 @@ void HdCompositor_Draw(uint8 *dst, size_t pitch,
                        const uint8 *sd_pixels,
                        int sd_width, int sd_height) {
   int S = g_hd_scale;
+  int hd_width  = sd_width  * S;
+  int hd_height = sd_height * S;
+
+  // 1. Nearest-upscale SD pixels into HD buffer (always — SD is the fallback).
   int src_pitch = sd_width * 4;
-  for (int y = 0; y < sd_height * S; y++) {
+  for (int y = 0; y < hd_height; y++) {
     const uint8 *src_row = sd_pixels + (y / S) * src_pitch;
     uint32_t *dst_row = (uint32_t *)((uint8 *)dst + y * pitch);
     const uint32_t *src32 = (const uint32_t *)src_row;
-    for (int x = 0; x < sd_width * S; x++)
+    for (int x = 0; x < hd_width; x++)
       dst_row[x] = src32[x / S];
   }
 
-  // Build the HD sprite scene from current PPU OAM state.
+  // 2. Build the HD sprite scene from current PPU OAM state.
   HdScene_Build(&g_hd_scene, g_my_ppu);
 
-  // Periodic always-on diagnostic dump (~once per second at 60fps).
+  // Periodic diagnostic dump (~once per second at 60fps).
   HdCompositor_DebugDump(&g_hd_scene);
 
-  // Per-layer composite: shadow pre-pass then color pass, alpha-blitted into dst.
+  // 3. HD composite passes.
   if (g_hd_scale > 1) {
-    int hd_width  = sd_width  * S;
-    int hd_height = sd_height * S;
     HdCompositor_EnsureBuffers(hd_width, hd_height);
-    size_t work_pitch = (size_t)hd_width * 4;
 
-    for (int layer = 0; layer < 4; layer++) {
-      const HdLayerCfg *cfg = &g_hd_layer_cfg[layer];
+    if (PPU_mode(g_my_ppu) == 1) {
+      // 11-pass priority-ordered composite (v2 Step 9a scaffolding).
+      // BG passes are no-op stubs until Step 9b/10; sprite passes are fully functional.
+      bool bg3prio = PPU_bg3priority(g_my_ppu) != 0;
 
-      // --- shadow pre-pass (if enabled) -----------------------------------
-      if (cfg->shadow_enabled) {
-        memset(g_hd_shadow_buf, 0, work_pitch * (size_t)hd_height);
-        for (int k = (int)g_hd_scene.count - 1; k >= 0; k--) {
-          const HdSprite *s = &g_hd_scene.sprites[k];
-          if (s->layer != (uint8)layer) continue;
-          HdCompositor_BlitSprite(g_hd_shadow_buf, work_pitch, hd_width, hd_height,
-                                  s, kHdBlitSilhouette,
-                                  cfg->shadow_dx, cfg->shadow_dy,
-                                  cfg->shadow_r, cfg->shadow_g, cfg->shadow_b,
-                                  cfg->shadow_alpha,
-                                  g_my_ppu);
-        }
-        HdCompositor_AlphaBlit(dst, pitch, g_hd_shadow_buf, work_pitch,
-                               hd_width, hd_height);
-      }
-
-      // --- sprite color pass ----------------------------------------------
-      memset(g_hd_layer_buf, 0, work_pitch * (size_t)hd_height);
-      for (int k = (int)g_hd_scene.count - 1; k >= 0; k--) {
-        const HdSprite *s = &g_hd_scene.sprites[k];
-        if (s->layer != (uint8)layer) continue;
-        HdCompositor_BlitSprite(g_hd_layer_buf, work_pitch, hd_width, hd_height,
-                                s, kHdBlitColor, 0, 0, 0, 0, 0, 0xff,
-                                g_my_ppu);
-      }
-      HdCompositor_AlphaBlit(dst, pitch, g_hd_layer_buf, work_pitch,
-                             hd_width, hd_height);
+      HdCompositor_BlitBgLayer(dst, pitch, hd_width, hd_height, 2, false, kHdBgLayer_BG3lo,        g_my_ppu);
+      HdCompositor_CompositeSpriteLayer(dst, pitch, hd_width, hd_height, 0, g_my_ppu);
+      if (!bg3prio)
+        HdCompositor_BlitBgLayer(dst, pitch, hd_width, hd_height, 2, true,  kHdBgLayer_BG3hi_noprio, g_my_ppu);
+      HdCompositor_CompositeSpriteLayer(dst, pitch, hd_width, hd_height, 1, g_my_ppu);
+      HdCompositor_BlitBgLayer(dst, pitch, hd_width, hd_height, 1, false, kHdBgLayer_BG2lo,        g_my_ppu);
+      HdCompositor_BlitBgLayer(dst, pitch, hd_width, hd_height, 0, false, kHdBgLayer_BG1lo,        g_my_ppu);
+      HdCompositor_CompositeSpriteLayer(dst, pitch, hd_width, hd_height, 2, g_my_ppu);
+      HdCompositor_BlitBgLayer(dst, pitch, hd_width, hd_height, 1, true,  kHdBgLayer_BG2hi,        g_my_ppu);
+      HdCompositor_BlitBgLayer(dst, pitch, hd_width, hd_height, 0, true,  kHdBgLayer_BG1hi,        g_my_ppu);
+      HdCompositor_CompositeSpriteLayer(dst, pitch, hd_width, hd_height, 3, g_my_ppu);
+      if (bg3prio)
+        HdCompositor_BlitBgLayer(dst, pitch, hd_width, hd_height, 2, true,  kHdBgLayer_BG3hi_prio,  g_my_ppu);
+    } else {
+      // Mode 7 or unknown mode: v1 sprite-on-top fallback (sprites already in SD baseline).
+      for (int p = 0; p < 4; p++)
+        HdCompositor_CompositeSpriteLayer(dst, pitch, hd_width, hd_height, p, g_my_ppu);
     }
   }
 }
@@ -207,15 +216,159 @@ const HdScene *HdCompositor_GetScene(void) {
 }
 
 // ---------------------------------------------------------------------------
+// Step 9a: per-OAM-priority sprite layer composite (shadow + color passes).
+// Extracted from the v1 per-layer loop so the 11-pass loop can call it.
+// ---------------------------------------------------------------------------
+static void HdCompositor_CompositeSpriteLayer(uint8 *dst, size_t pitch,
+                                              int hd_w, int hd_h,
+                                              int oam_prio, const Ppu *ppu) {
+  const HdLayerCfg *cfg = &g_hd_layer_cfg[oam_prio];
+  size_t work_pitch = (size_t)hd_w * 4;
+
+  // --- shadow pre-pass (if enabled) ---
+  if (cfg->shadow_enabled) {
+    memset(g_hd_shadow_buf, 0, work_pitch * (size_t)hd_h);
+    for (int k = (int)g_hd_scene.count - 1; k >= 0; k--) {
+      const HdSprite *s = &g_hd_scene.sprites[k];
+      if (s->layer != (uint8)oam_prio) continue;
+      HdCompositor_BlitSprite(g_hd_shadow_buf, work_pitch, hd_w, hd_h,
+                              s, kHdBlitSilhouette,
+                              cfg->shadow_dx, cfg->shadow_dy,
+                              cfg->shadow_r, cfg->shadow_g, cfg->shadow_b,
+                              cfg->shadow_alpha,
+                              ppu);
+    }
+    HdCompositor_AlphaBlit(dst, pitch, g_hd_shadow_buf, work_pitch, hd_w, hd_h,
+                            (int)kHdSpritePrioToLayer[oam_prio]);
+  }
+
+  // --- sprite color pass ---
+  memset(g_hd_layer_buf, 0, work_pitch * (size_t)hd_h);
+  for (int k = (int)g_hd_scene.count - 1; k >= 0; k--) {
+    const HdSprite *s = &g_hd_scene.sprites[k];
+    if (s->layer != (uint8)oam_prio) continue;
+    HdCompositor_BlitSprite(g_hd_layer_buf, work_pitch, hd_w, hd_h,
+                            s, kHdBlitColor, 0, 0, 0, 0, 0, 0xff, ppu);
+  }
+  HdCompositor_AlphaBlit(dst, pitch, g_hd_layer_buf, work_pitch, hd_w, hd_h,
+                         (int)kHdSpritePrioToLayer[oam_prio]);
+}
+
+// ---------------------------------------------------------------------------
+// Step 9b: 4bpp BG1/BG2 tile compositor.
+// Iterates over every SD pixel, checks the priority gate, resolves the HD
+// tile from the VRAM map, and expands each SD pixel into S×S HD pixels.
+// BG3 (2bpp) is added in Step 10.
+// ---------------------------------------------------------------------------
+static void HdCompositor_BlitBgLayer(uint8 *dst, size_t pitch,
+                                     int hd_w, int hd_h,
+                                     int bg_layer, bool prio_hi,
+                                     HdBgLayerID expected_layer,
+                                     const Ppu *ppu) {
+  if (!g_hd_bg_enabled[bg_layer]) return;
+  if (PPU_mode(ppu) != 1) return;
+  if (!g_new_ppu) return;                         // old PPU: bgBuffers not populated
+  if (!g_hd_prio_map) return;
+  // Mosaic: fall back to SD upscale to avoid out-of-sync HD rendering.
+  if (PPU_mosaicSize(ppu) > 1 && PPU_mosaicEnabled(ppu, bg_layer)) return;
+
+  int S    = (int)g_hd_scale;
+  int sd_h = hd_h / S;
+  int sd_w = hd_w / S;
+  int tileadr = PPU_bgTileAdr(ppu, bg_layer);
+
+  for (int sy = 0; sy < sd_h; sy++) {
+    // Per-row scrolled tilemap pointers — mirror PpuDrawBackground_4bpp lines.
+    uint y_scrolled = (uint)(sy + ppu->vScroll[bg_layer]);
+    int sc_offs = (int)PPU_bgTilemapAdr(ppu, bg_layer)
+                  + (int)(((y_scrolled >> 3) & 0x1f) << 5);
+    if ((y_scrolled & 0x100) && PPU_bgTilemapHigher(ppu, bg_layer))
+      sc_offs += PPU_bgTilemapWider(ppu, bg_layer) ? 0x800 : 0x400;
+    const uint16 *tps[2] = {
+      &ppu->vram[sc_offs & 0x7fff],
+      &ppu->vram[(sc_offs + (PPU_bgTilemapWider(ppu, bg_layer) ? 0x400 : 0)) & 0x7fff],
+    };
+    int y_in_tile = (int)(y_scrolled & 7);
+
+    uint x_scrolled = (uint)ppu->hScroll[bg_layer];
+    for (int sx = 0; sx < sd_w; sx++, x_scrolled++) {
+      // Priority gate: only paint where this layer won at this SD pixel.
+      if (HdDecodeZbuf(g_hd_prio_map[sy * 256 + sx]) != expected_layer) continue;
+
+      const uint16 *tp = tps[(x_scrolled >> 8) & 1];
+      uint16 te = tp[(x_scrolled >> 3) & 0x1f];
+
+      // Skip if the tile's prio bit doesn't match what we're rendering.
+      if (((te >> 13) & 1) != (uint)(prio_hi ? 1 : 0)) continue;
+
+      int  tile_num = (int)(te & 0x3ff);
+      int  palette  = (int)((te >> 10) & 7);
+      bool hflip    = (te >> 14) & 1;
+      bool vflip    = (te >> 15) & 1;
+
+      uint16 tile_vram = (uint16)((tileadr + tile_num * 16) & 0x7fff);
+      uint8  sheet_id;
+      uint16 tile_in_sheet;
+      if (!HdVramMap_ResolveTile(tile_vram, &sheet_id, &tile_in_sheet)) continue;
+      const HdSheet *sheet = &g_hd_sheets[sheet_id];
+      if (!sheet->loaded || sheet->scale != (uint8)S) continue;
+      if (tile_in_sheet >= sheet->tile_count) continue;
+
+      // Within-tile SD pixel position, with flip applied.
+      int xi_sd = hflip ? (7 - (int)(x_scrolled & 7)) : (int)(x_scrolled & 7);
+      int yi_sd = vflip ? (7 - y_in_tile)             : y_in_tile;
+
+      // Top-left of this SD pixel's S×S block in the HD sheet.
+      int tx_px = (tile_in_sheet & 0xf) * 8 * S + xi_sd * S;
+      int ty_px = (tile_in_sheet >> 4)  * 8 * S + yi_sd * S;
+      int sh_w  = (int)sheet->width;
+      const uint8 *idx = sheet->index_buffer;
+      const uint16 *cgram = ppu->cgram;
+      const uint8  *bmult = ppu->brightnessMult;
+      int pal_base = palette * 16;  // BG CGRAM: no 0x80 offset (sprites only)
+
+      int out_x = sx * S, out_y = sy * S;
+      for (int py = 0; py < S; py++) {
+        int src_py = vflip ? (S - 1 - py) : py;
+        uint32_t *dst_row = (uint32_t *)(dst + (size_t)(out_y + py) * pitch);
+        for (int px = 0; px < S; px++) {
+          int src_px = hflip ? (S - 1 - px) : px;
+          uint8 index = idx[(ty_px + src_py) * sh_w + tx_px + src_px];
+          if (index == 0) continue;  // transparent: leave SD baseline
+          uint16 color = cgram[pal_base + index];
+          uint8 r = bmult[(color >>  0) & 0x1f];
+          uint8 g = bmult[(color >>  5) & 0x1f];
+          uint8 b = bmult[(color >> 10) & 0x1f];
+          dst_row[out_x + px] = (uint32_t)b | ((uint32_t)g << 8)
+                               | ((uint32_t)r << 16) | 0xff000000u;
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Alpha-blit helper.  Composites src (BGRA) onto dst using src alpha.
+// gate_layer >= 0: sprite gate — only blit where decoded prio layer <= gate_layer.
+//   Sprites are skipped from the PPU pixel render when HD is active, so only
+//   BG z-values appear in g_hd_prio_map.  "<= gate_layer" means: draw the HD
+//   sprite pixel unless a BG layer with strictly higher priority already won it.
+// gate_layer == -1: no gate (unconditional blit).
 // ---------------------------------------------------------------------------
 static void HdCompositor_AlphaBlit(uint8 *dst, size_t dst_pitch,
                                    const uint8 *src, size_t src_pitch,
-                                   int w, int h) {
+                                   int w, int h, int gate_layer) {
+  bool gated = (gate_layer >= 0) && (g_hd_prio_map != NULL);
+  int  S     = (int)g_hd_scale;
   for (int y = 0; y < h; y++) {
     uint8       *dst_row = dst + y * dst_pitch;
     const uint8 *src_row = src + y * src_pitch;
+    int sd_y = (gated) ? (y / S) : 0;
     for (int x = 0; x < w; x++) {
+      if (gated) {
+        int sd_x = x / S;
+        if ((int)HdDecodeZbuf(g_hd_prio_map[sd_y * 256 + sd_x]) > gate_layer) continue;
+      }
       uint8 a = src_row[x * 4 + 3];
       if (a == 0) continue;
       uint8 inv = (uint8)(255 - a);
