@@ -1,11 +1,11 @@
 TARGET_EXEC:=smw
 
-SRCS:=$(wildcard smb1/*.c smbll/*.c src/*.c src/snes/*.c) third_party/gl_core/gl_core_3_1.c
+SRCS:=$(wildcard smb1/*.c smbll/*.c src/*.c src/snes/*.c src/hd/*.c) third_party/gl_core/gl_core_3_1.c
 OBJS:=$(SRCS:%.c=%.o)
 
 PYTHON:=/usr/bin/env python3
 CFLAGS:=$(if $(CFLAGS),$(CFLAGS),-O2 -fno-strict-aliasing -Werror )
-CFLAGS:=${CFLAGS} $(shell sdl2-config --cflags) -DSYSTEM_VOLUME_MIXER_AVAILABLE=0 -I.
+CFLAGS:=${CFLAGS} $(shell sdl2-config --cflags) -DSYSTEM_VOLUME_MIXER_AVAILABLE=0 -I. -Isrc
 
 ifeq (${OS},Windows_NT)
     WINDRES:=windres
@@ -31,6 +31,29 @@ $(TARGET_EXEC): $(OBJS) $(RES)
 smw_assets.dat:
 	@echo "Extracting game resources"
 	$(PYTHON) assets/restool.py
+
+# ---------------------------------------------------------------------------
+# Unit tests — each tests/test_*.c compiles to its own binary.
+# Tests link only the specific src/hd/*.c files they exercise, not the full
+# game.  No SDL dependency.
+# ---------------------------------------------------------------------------
+TEST_SRCS := $(wildcard tests/test_*.c)
+TEST_BINS := $(TEST_SRCS:tests/%.c=tests/%.elf)
+TEST_CFLAGS := -O0 -g -Werror -I. -Isrc -Ithird_party/unity
+
+tests/test_hd_vram_map.elf: tests/test_hd_vram_map.c \
+                              src/hd/hd_vram_map.c \
+                              third_party/unity/unity.c
+	$(CC) $(TEST_CFLAGS) -o $@ $^
+
+.PHONY: test
+test: $(TEST_BINS)
+	@failed=0; \
+	for t in $(TEST_BINS); do \
+	    echo "--- $$t ---"; \
+	    ./$$t || failed=1; \
+	done; \
+	exit $$failed
 
 clean: clean_obj clean_gen
 clean_obj:

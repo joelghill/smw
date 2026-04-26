@@ -33,6 +33,14 @@ static int          g_staging_count;
 
 void HdVramMap_Reset(void) {
   g_region_count = 0;
+  // Pre-register catch-all placeholder covering the full VRAM range.
+  // Appended first (index 0 = oldest) so any real upload (tile_count <= 128)
+  // beats it in the smallest-tile-count tiebreak used by ResolveTile.
+  g_regions[0].vram_word_addr  = 0x0000;
+  g_regions[0].tile_count      = 0x0800;  // covers 0x0000..0x7FFF (full VRAM)
+  g_regions[0].sheet_id        = 0xFE;    // reserved: placeholder
+  g_regions[0].src_tile_offset = 0;
+  g_region_count = 1;
   // Staging registry is intentionally NOT cleared here.
 }
 
@@ -58,7 +66,7 @@ void HdVramMap_RegisterStaging(uint8 sheet_id, const uint8 *base, size_t size,
 
 void HdVramMap_RecordSheetUpload(uint16 dst_word_addr, uint8 sheet_id,
                                  uint16 src_tile_offset, uint16 tile_count) {
-  if (sheet_id == 0xFF || tile_count == 0)
+  if (tile_count == 0)
     return;
   if (g_region_count < kMaxRegions) {
     g_regions[g_region_count].vram_word_addr  = dst_word_addr;
@@ -166,6 +174,12 @@ bool HdVramMap_ResolveTile(uint16 vram_word_addr, uint8 *sheet_out,
   if (best < 0)
     return false;
   const HdVramRegion *r = &g_regions[best];
+  // 0xFE = placeholder catch-all: derive tile_in_sheet from VRAM address.
+  if (r->sheet_id == 0xFE) {
+    *sheet_out = 0xFE;
+    *tile_out  = (uint16)((vram_word_addr >> 4) & 0x7F);
+    return true;
+  }
   // 0xFF = explicit unmapped marker: return false so the compositor skips.
   if (r->sheet_id == 0xFF)
     return false;

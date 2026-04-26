@@ -20,4 +20,5 @@ __pycache__
 /gfx/source/*
 /gfx/smoothed/*
 *.log
+tests/*.elf
 

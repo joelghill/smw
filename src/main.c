@@ -19,10 +19,11 @@
 
 #include "types.h"
 #include "smw_rtl.h"
-#include "hd_compositor.h"
-#include "hd_gfx.h"
-#include "hd_scene.h"
-#include "hd_vram_map.h"
+#include "hd/hd_compositor.h"
+#include "hd/hd_frame.h"
+#include "hd/hd_gfx.h"
+#include "hd/hd_scene.h"
+#include "hd/hd_vram_map.h"
 #include "common_cpu_infra.h"
 #include "config.h"
 #include "util.h"
@@ -67,6 +68,7 @@ struct SpcPlayer *g_spc_player;
 
 static uint8_t g_pixels[256 * 4 * 240];
 static uint8_t g_my_pixels[256 * 4 * 240];
+static HdRenderInput g_hd_render_input;
 
 int g_got_mismatch_count;
 
@@ -183,15 +185,12 @@ static SDL_HitTestResult HitTestCallback(SDL_Window *win, const SDL_Point *pt, v
 void RtlDrawPpuFrame(uint8 *pixel_buffer, size_t pitch, uint32 render_flags) {
   bool hd_active = g_hd_enabled && g_hd_scale > 1;
   g_hd_skip_sprites = hd_active;  // skip SD sprites when HD is active; HD compositor replaces them
-  // v2 Step 8: clear priority map before the PPU runs so forced-blank scanlines
-  // stay as kHdBgLayer_Backdrop (z=0) and never pass any HD gate.
-  if (hd_active && g_hd_prio_map)
-    memset(g_hd_prio_map, 0, 256 * 240 * sizeof(uint16));
   g_rtl_game_info->draw_ppu_frame();
 
   uint8 *ppu_pixels = g_other_image ? g_my_pixels : g_pixels;
   if (hd_active) {
-    HdCompositor_Draw(pixel_buffer, pitch, ppu_pixels, g_snes_width, g_snes_height);
+    HdFrame_Build(&g_hd_render_input, g_my_ppu);
+    HdCompositor_Draw(pixel_buffer, pitch, &g_hd_render_input);
   } else {
     for (size_t y = 0, y_end = g_snes_height; y < y_end; y++)
       memcpy((uint8 *)pixel_buffer + y * pitch, ppu_pixels + y * 256 * 4, 256 * 4);
@@ -559,7 +558,7 @@ error_reading:;
         break;
       case SDL_KEYDOWN:
         if (event.key.keysym.sym == SDLK_F12) { HdVramMap_Dump(); break; }
-        if (event.key.keysym.sym == SDLK_F11) { HdScene_Dump(HdCompositor_GetScene()); break; }
+        if (event.key.keysym.sym == SDLK_F11) { HdScene_Dump(&g_hd_render_input.frame.sprites); break; }
         HandleInput(event.key.keysym.sym, event.key.keysym.mod, true);
         break;
       case SDL_KEYUP:

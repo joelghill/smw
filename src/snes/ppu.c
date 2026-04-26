@@ -9,7 +9,7 @@
 
 #include "snes.h"
 #include "snes_regs.h"
-#include "../hd_compositor.h"
+#include "../hd/hd_compositor.h"
 
 
 extern bool g_new_ppu;
@@ -669,18 +669,6 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
 
   // Render main screen
   PpuDrawBackgrounds(ppu, y, false);
-
-  // v2 Step 8: capture per-pixel priority z-buffer for the HD compositor.
-  // Use extern decls to avoid pulling hd_compositor.h into ppu.c.
-  {
-    extern uint16 *g_hd_prio_map;
-    extern bool    g_hd_enabled;
-    if (g_hd_enabled && g_hd_prio_map) {
-      int sy = (int)y - 1;  // y is 1-based in PpuDrawWholeLine
-      if ((unsigned)sy < 240)
-        memcpy(g_hd_prio_map + (size_t)sy * 256, ppu->bgBuffers[0].data, 256 * sizeof(uint16));
-    }
-  }
 
   // Render also the subscreen?
   bool rendered_subscreen = false;

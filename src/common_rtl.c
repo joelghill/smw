@@ -4,7 +4,7 @@
 #include "util.h"
 #include "config.h"
 #include "snes/snes.h"
-#include "hd_vram_map.h"
+#include "hd/hd_vram_map.h"
 
 struct StateRecorder;
 

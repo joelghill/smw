@@ -3,7 +3,7 @@
 #include "smw_rtl.h"
 #include "variables.h"
 #include "assets/smw_assets.h"
-#include "hd_vram_map.h"
+#include "hd/hd_vram_map.h"
 #include "common_cpu_infra.h"
 #include "snes/snes.h"
 
